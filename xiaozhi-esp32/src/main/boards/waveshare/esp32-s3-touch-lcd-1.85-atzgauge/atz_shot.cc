@@ -6,6 +6,7 @@
 #include "display.h"
 #include "espnow_link.h"
 #include "atz_car_page.h"
+#include "atz_hit_zone.h"
 #include "atz_perf.h"
 #include "atz_rpm_ring.h"
 #include "atz_trip.h"
@@ -35,6 +36,7 @@ httpd_handle_t g_server = nullptr;
 // 前置声明：StartTask 里要注册这两个 handler，而它们的定义在文件后面
 esp_err_t CarBarHandler(httpd_req_t* req);
 esp_err_t TouchHandler(httpd_req_t* req);
+esp_err_t TapHandler(httpd_req_t* req);
 esp_err_t CarPageHandler(httpd_req_t* req);
 esp_err_t SizeHandler(httpd_req_t* req);
 esp_err_t PerfHandler(httpd_req_t* req);
@@ -410,6 +412,13 @@ void StartTask(void* arg) {
                 .handler = SubtitleHandler,
                 .user_ctx = nullptr,
             };
+            // /tap：合成一次点击（不碰触摸硬件），用来验证"按钮回调真的通了"
+            httpd_uri_t tap_uri = {
+                .uri = "/tap",
+                .method = HTTP_GET,
+                .handler = TapHandler,
+                .user_ctx = nullptr,
+            };
             httpd_register_uri_handler(g_server, &shot_uri);
             httpd_register_uri_handler(g_server, &health_uri);
             httpd_register_uri_handler(g_server, &theme_uri);
@@ -440,6 +449,9 @@ void StartTask(void* arg) {
             }
             if (httpd_register_uri_handler(g_server, &subtitle_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/subtitle registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &tap_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/tap registration failed (max_uri_handlers too small?)");
             }
 
             ESP_LOGI(TAG, "screen snapshot ready: http://" IPSTR ":%d/shot.jpg", IP2STR(&ip.ip),
@@ -491,6 +503,8 @@ esp_err_t CarBarHandler(httpd_req_t* req) {
 // 台架用：触摸面板自检 —— 打开页面后点屏幕，页面直接告诉你面板到底答不答。
 //   http://<设备IP>:8099/touch?seconds=15
 // 这是区分"固件逻辑问题"与"面板不应答 I2C"的唯一可靠手段。
+// ★ 2026-09-17 追加：把**已注册的点击区**一起列出来 —— 按钮"点不动"时，先确认
+//   "区到底注册上没有、坐标对不对"，再看面板答不答。
 esp_err_t TouchHandler(httpd_req_t* req) {
     char query[64] = {};
     char value[16] = {};
@@ -499,9 +513,66 @@ esp_err_t TouchHandler(httpd_req_t* req) {
         httpd_query_key_value(query, "seconds", value, sizeof(value)) == ESP_OK) {
         seconds = atoi(value);
     }
-    char report[256] = {};
+    char report[512] = {};
     atz_touch_watch(seconds, report, sizeof(report));   // 阻塞 seconds 秒（调试端点，可接受）
-    return httpd_resp_send(req, report, HTTPD_RESP_USE_STRLEN);
+    char body[768];
+    int n = snprintf(body, sizeof(body), "%s\nhit zones (%d):", report, atz_hit_zone_count());
+    for (int i = 0; i < atz_hit_zone_count() && n < (int)sizeof(body) - 48; i++) {
+        int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        const char* name = nullptr;
+        if (atz_hit_zone_info(i, &x1, &y1, &x2, &y2, &name)) {
+            n += snprintf(body + n, sizeof(body) - n, "\n  [%d] %s (%d,%d)-(%d,%d)", i, name, x1,
+                          y1, x2, y2);
+        }
+    }
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+// 台架用：**合成一次点击**（不碰触摸硬件）—— 用来验证"命中区 → 按钮回调 → UI 刷新"
+// 这条链路本身是通的，从而把"固件逻辑问题"和"面板/触摸读不到坐标"彻底分开。
+//   http://<设备IP>:8099/tap?x=240&y=50&key=…     行程页「清零重来」按钮中心
+//   http://<设备IP>:8099/tap?x=120&y=50&key=…     行程页「暂停/开始记录」按钮中心
+//   http://<设备IP>:8099/tap?x=180&y=340&key=…    底部翻页提示条
+// 不带 x/y 时返回**所有点击区的中心点**，方便直接照着点。
+esp_err_t TapHandler(httpd_req_t* req) {
+    char query[96] = {};
+    char value[16] = {};
+    int x = -1, y = -1;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "x", value, sizeof(value)) == ESP_OK) {
+            x = atoi(value);
+        }
+        if (httpd_query_key_value(query, "y", value, sizeof(value)) == ESP_OK) {
+            y = atoi(value);
+        }
+    }
+    char body[768];
+    if (x < 0 || y < 0) {
+        int n = snprintf(body, sizeof(body), "hit zones = %d; center points to tap:", atz_hit_zone_count());
+        for (int i = 0; i < atz_hit_zone_count() && n < (int)sizeof(body) - 56; i++) {
+            int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            const char* name = nullptr;
+            if (atz_hit_zone_info(i, &x1, &y1, &x2, &y2, &name)) {
+                n += snprintf(body + n, sizeof(body) - n, "\n  [%d] %s -> /tap?x=%d&y=%d&key=…", i,
+                              name, (x1 + x2) / 2, (y1 + y2) / 2);
+            }
+        }
+        return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    }
+    if (!WriteAllowed(req)) {   // 合成点击会改状态，算写操作
+        return DenyWrite(req);
+    }
+    const int id = atz_hit_zone_test(x, y);
+    const char* name = "(none)";
+    if (id >= 0) {
+        atz_hit_zone_info(id, nullptr, nullptr, nullptr, nullptr, &name);
+        atz_hit_zone_fire(id);
+        ESP_LOGI(TAG, "/tap (%d,%d) -> zone %d [%s] fired", x, y, id, name);
+    } else {
+        ESP_LOGI(TAG, "/tap (%d,%d) -> no zone hit", x, y);
+    }
+    snprintf(body, sizeof(body), "tap (%d,%d) -> zone=%d [%s]\n", x, y, id, name);
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 
 // 台架用：显示/隐藏「车况」整屏页面（等价于语音工具 self.ui.show_car_page）

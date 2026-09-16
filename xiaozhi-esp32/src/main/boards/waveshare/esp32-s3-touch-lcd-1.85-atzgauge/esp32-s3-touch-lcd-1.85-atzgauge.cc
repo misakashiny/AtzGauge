@@ -19,6 +19,8 @@
 #include "atz_shot.h"
 // 「车况」整屏页面（语音进入）。见 atz_car_page.h。
 #include "atz_car_page.h"
+// 触摸点击区（按钮命中判定）：本项目没给 LVGL 注册输入设备，按钮点击走这里。见 atz_hit_zone.h。
+#include "atz_hit_zone.h"
 #include "atz_dim.h"
 #include "lvgl_theme.h"
 #include "settings.h"
@@ -927,12 +929,35 @@ public:
         int reads_ok = 0;
         int reads_fail = 0;
         int max_fingers = 0;
+        // ★ 2026-09-17 追加：把**坐标**也读出来。以前这个自检只统计"读到几次手指"，
+        //   所以"按钮点不动"时分不清是①面板没答案 ②坐标读出来了但落在按钮外面
+        //   ③坐标的坐标系与我们以为的不一样（旋转/镜像）。现在直接把最后落点、范围
+        //   和命中的点击区打出来，一次就能定性。
+        int last_x = -1, last_y = -1;
+        int min_x = 9999, max_x = -1, min_y = 9999, max_y = -1;
+        int hits = 0;
+        const char* last_zone = "(none)";
         for (int i = 0; i < samples; i++) {
             uint8_t data[5] = {};
             if (TouchRead(data, sizeof(data)) == ESP_OK) {
                 reads_ok++;
                 if (data[0] > max_fingers) {
                     max_fingers = data[0];
+                }
+                if (data[0] > 0) {
+                    last_x = ((int)(data[1] & 0x0F) << 8) | data[2];
+                    last_y = ((int)(data[3] & 0x0F) << 8) | data[4];
+                    if (last_x < min_x) min_x = last_x;
+                    if (last_x > max_x) max_x = last_x;
+                    if (last_y < min_y) min_y = last_y;
+                    if (last_y > max_y) max_y = last_y;
+                    const int z = atz_hit_zone_test(last_x, last_y);
+                    if (z >= 0) {
+                        hits++;
+                        atz_hit_zone_info(z, nullptr, nullptr, nullptr, nullptr, &last_zone);
+                    } else {
+                        last_zone = "(none)";
+                    }
                 }
             } else {
                 reads_fail++;
@@ -942,8 +967,17 @@ public:
         const char* verdict = max_fingers > 0  ? "TOUCH DETECTED"
                               : reads_ok > 0   ? "chip answering, but no touch seen"
                                                : "chip not answering";
-        snprintf(out, out_len, "touch watch %ds: reads_ok=%d reads_fail=%d max_fingers=%d -> %s",
-                 seconds, reads_ok, reads_fail, max_fingers, verdict);
+        if (max_fingers > 0) {
+            snprintf(out, out_len,
+                     "touch watch %ds: reads_ok=%d reads_fail=%d max_fingers=%d -> %s\n"
+                     "last point=(%d,%d)  range x=%d..%d y=%d..%d\n"
+                     "hit-zone samples=%d, last zone=%s",
+                     seconds, reads_ok, reads_fail, max_fingers, verdict, last_x, last_y, min_x,
+                     max_x, min_y, max_y, hits, last_zone);
+        } else {
+            snprintf(out, out_len, "touch watch %ds: reads_ok=%d reads_fail=%d max_fingers=%d -> %s",
+                     seconds, reads_ok, reads_fail, max_fingers, verdict);
+        }
         ESP_LOGI(TAG, "%s", out);
         return max_fingers > 0;
     }
@@ -998,6 +1032,8 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
     bool latched = false;        // one trigger per press: re-armed only after release
     uint32_t reads_ok = 0, reads_fail = 0, ticks = 0;
     uint8_t last_finger = 0;
+    int last_x = -1, last_y = -1;
+    int last_hit = -1;
 
     while (true) {
         uint8_t data[5] = {};
@@ -1008,6 +1044,11 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
             reads_ok++;
             last_finger = data[0];
             down = (data[0] > 0);   // data[0] = finger count
+            if (down) {
+                // CST816S 的 5 字节：FingerNum, XH, XL, YH, YL —— X/Y 都是 12 位
+                last_x = ((int)(data[1] & 0x0F) << 8) | data[2];
+                last_y = ((int)(data[3] & 0x0F) << 8) | data[4];
+            }
         } else {
             // A NACK is the normal idle case: a sleeping CST816S does not ACK its
             // address. Treat it as "not pressed" and keep polling -- never
@@ -1016,14 +1057,29 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
         }
 
         if (down) {
+            // ★ 每次采样都算一次命中：即使 `latched` 已经为真，也要继续更新 last_hit，
+            //   这样 /touch 自检才能报告"手指现在压在哪个区"（调排版时很有用）。
+            last_hit = (last_x >= 0) ? atz_hit_zone_test(last_x, last_y) : -1;
             if (!latched && ++down_samples >= TP_CONFIRM_SAMPLES) {
                 latched = true;
                 atz_dim_kick();   // 有人碰屏幕 = 有交互 → 立刻恢复全亮
-                if (atz_car_page_visible()) {
-                    // 车况/行程整屏页开着时，点屏 = 翻页（实时数值 ↔ 行程统计），
-                    // 而不是打断当前对话。否则用户想翻个页就把小智喊起来了 —— 很烦。
-                    atz_car_page_flip();
-                    ESP_LOGI(TAG, "touch tap -> car page flipped");
+                if (last_hit >= 0) {
+                    // ── 点到「点击区」= 真的去按那个按钮 ──────────────────────
+                    // ★ 2026-09-17 的根因修复：本项目**没有给 LVGL 注册输入设备**，
+                    //   所以 lv_button 的 LV_EVENT_CLICKED 永远不触发（用户报"按钮点不动"
+                    //   就是这个）。命中判定改成自己算，链路见 atz_hit_zone.h。
+                    const char* zone_name = "(unnamed)";
+                    int zx1 = 0, zy1 = 0, zx2 = 0, zy2 = 0;
+                    atz_hit_zone_info(last_hit, &zx1, &zy1, &zx2, &zy2, &zone_name);
+                    ESP_LOGI(TAG, "touch tap (%d,%d) -> hit zone %d [%s] (%d,%d)-(%d,%d)",
+                             last_x, last_y, last_hit, zone_name, zx1, zy1, zx2, zy2);
+                    atz_hit_zone_fire(last_hit);   // 回调自己加显示锁
+                } else if (atz_car_page_visible()) {
+                    // 车况/行程整屏页开着、但没点到任何按钮：**什么都不做**。
+                    // （以前这里是"点一下翻页"，结果用户想按按钮时被翻页抢走了 ——
+                    //   现在翻页有自己的点击区，见 atz_car_page.cc。）
+                    ESP_LOGI(TAG, "touch tap (%d,%d) on car page -> no zone hit, ignored",
+                             last_x, last_y);
                 } else {
                     DeviceState state = app.GetDeviceState();
                     if (state == kDeviceStateIdle) {
@@ -1045,8 +1101,9 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
         // log level for this tag is raised.
         if (++ticks % (5000 / TP_POLL_INTERVAL_MS) == 0) {
             ESP_LOG_LEVEL(TP_DIAG ? ESP_LOG_INFO : ESP_LOG_DEBUG, TAG,
-                          "touch diag: ok=%u fail=%u last_finger=%u",
-                          (unsigned)reads_ok, (unsigned)reads_fail, (unsigned)last_finger);
+                          "touch diag: ok=%u fail=%u last_finger=%u last=(%d,%d) hit=%d zones=%d",
+                          (unsigned)reads_ok, (unsigned)reads_fail, (unsigned)last_finger, last_x,
+                          last_y, last_hit, atz_hit_zone_count());
         }
 
         vTaskDelay(pdMS_TO_TICKS(TP_POLL_INTERVAL_MS));
