@@ -197,52 +197,48 @@
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. 转速外圈（**不受 ATZ_UI_ENABLE 影响，始终生效**）
-//    ★ 只画**一个环**：整圈 = 底槽，跟着转速点亮的一段 = 指示弧（参考 obd_brz_gauge）。
 //
-//    ★★ 关于"完全贴死、不留缝隙"（2026-09-16 二改，实测记录）★★
-//      · LVGL 的弧是"从对象半径**往内**画"的：
-//          d=340 / w=20 → 只占半径 150~170（离屏幕边 10px，早期版本的"离边"就是这里来的）
-//          d=360 / w=26 → 占半径 154~180（外缘正好到面板边）
-//      · 像素扫描确认：外缘确实到了 x=0 / y=0 / y=359（帧缓冲最外圈），**已经没有像素可让**。
-//      · 那"看着还有几个像素"是什么？—— **底槽太淡**（不透明度 40/255，浅色主题下
-//        几乎看不见），眼睛只把暗色那段当"环"，于是把外面淡掉的一圈当成了空隙。
-//      · 所以最终做法是两条一起：
-//          ① 直径放大到 **380**（比屏幕还大）→ 弧的外半圈被面板边缘**直接裁掉**，
-//             不管怎么量都不可能再出现缝隙（这也是唯一能"贴死"的可靠办法：
-//             软件最多画到面板最后一像素，那就干脆画出去、让面板去裁）；
-//          ② 底槽不透明度提到 **90** → 整圈都是清清楚楚的环，不会再看错。
-//      · 若仍觉得与外壳之间有空隙，那圈空隙在**面板可寻址像素之外**（模组的黑边/玻璃边），
-//        软件无法绘制 —— 判断方法：让整屏显示纯白（浅色主题），看白色是否一直铺到玻璃边。
+//    ★ 按 obd_brz_gauge 的转速页设计（参考 src/screens/ui_ScreenPageRpm.c）：
+//        ① 屏幕最外沿一圈**细环**（bezel）—— ui_helpers_create_ring(page, 10)
+//        ② 环**内侧**一圈转速弧：lv_arc 340×340 / arc_width 20 / 直角 / 实心底槽
+//        ③ 底槽是暗色，指示弧用主题强调色；不画旋钮
+//      obd_brz_gauge 的两条是"外细内粗"，层次分明；早期我们做过"外 5px + 内 9px"两条细环，
+//      两条都细才显得糊——现在的比例照抄参照物。
+//
+//    几何（360×360 圆屏）：
+//        bezel: 直径 360、线宽 10 → 占半径 170~180（外缘正好在屏幕边，无空隙）
+//        arc  : 直径 340、线宽 20 → 占半径 150~170（紧贴 bezel 内侧，不相交）
+//    ★ LVGL 的弧是"从对象半径往内画"，所以 bezel 直径取 360 就能贴死屏幕边。
+//    ★ 两个对象都必须带 LV_OBJ_FLAG_FLOATING，否则会把屏幕撑出滚动条（见缺陷 #21）。
 // ═══════════════════════════════════════════════════════════════════════════
-#define ATZ_RPM_RING_ENABLE         1      // 总开关
-#define ATZ_RPM_RING_D              380    // 环对象直径（px）：>360 = 故意让外缘被屏幕裁掉
-#define ATZ_RPM_RING_W              36     // 环线宽（px）：可见部分约 154~180（26px）
-#define ATZ_RPM_RING_TRACK_OPA      90     // 底槽不透明度 0~255（整圈要看得见）
+#define ATZ_RPM_RING_ENABLE         1      // 总开关（运行时也能用语音/端点改，存 NVS）
+
+// ── ① 外沿细环（obd_brz_gauge 的 create_ring(page, 10)）────────────────────
+#define ATZ_RPM_RING_BEZEL          1      // 0 = 不画最外沿细环
+#define ATZ_RPM_RING_BEZEL_D        360    // 细环直径（= 屏幕边）
+#define ATZ_RPM_RING_BEZEL_W        10     // 细环线宽（参照物用 10）
+#define ATZ_RPM_RING_BEZEL_COLOR    0      // 0 = 跟随主题文字色；或写死 0xRRGGBB
+#define ATZ_RPM_RING_BEZEL_OPA      255    // 细环不透明度
+
+// ── ② 转速弧（obd_brz_gauge 的 ui_RpmPageArcRpmBack）──────────────────────
+#define ATZ_RPM_RING_D              340    // 弧直径（参照物用 340）
+#define ATZ_RPM_RING_W              20     // 弧线宽（参照物用 20）
+#define ATZ_RPM_RING_ROUNDED        0      // 参照物是**直角**（0），要圆头改 1
+#define ATZ_RPM_RING_TRACK_COLOR    0      // 底槽色：0 = 主题文字色（再用下面的 OPA 压暗）
+#define ATZ_RPM_RING_TRACK_OPA      70     // 底槽不透明度 0~255（实心底槽太抢眼，参照物在深色底上用了 #333）
+#define ATZ_RPM_RING_BASE_COLOR     0      // 指示弧基色：0 = 跟随主题文字色；浅底建议 0x0A84FF、深底 0xFFFFFF
+
 #define ATZ_RPM_RING_MAX_RPM        8000   // 环走满一圈对应的转速
 #define ATZ_RPM_RING_WARN_RPM       5500   // 到这里的弧变琥珀色
 #define ATZ_RPM_RING_ALARM_RPM      6500   // 到这里的弧变红色（与 car_alarm 阈值一致）
+#define ATZ_RPM_RING_WARN_COLOR     0xFFA000
+#define ATZ_RPM_RING_ALARM_COLOR    0xFF3B30
 
-// ── 外观（2026-09-16 美化）──────────────────────────────────────────────────
-#define ATZ_RPM_RING_ROUNDED        1      // 弧线两端**圆头**：更像真表，观感柔和很多
-#define ATZ_RPM_RING_BASE_COLOR     0      // 指示弧基色；0 = 跟随主题文字色（深色主题=白、浅色主题=近黑）
-                                           //   想固定就写 0xRRGGBB：浅底建议 0x0A84FF（蓝），深底建议 0xFFFFFF
-#define ATZ_RPM_RING_WARN_COLOR     0xFFA000   // 接近上限：琥珀
-#define ATZ_RPM_RING_ALARM_COLOR    0xFF3B30   // 超限：红（与告警/车况页同色）
-// 红区刻度：在环**内侧**再画一条细弧标出"红线区"（ALARM_RPM → 满圈）。
-// 为什么放内侧：指示弧占半径 154~190，标在 148~152 不会被它盖住；而且它是**静态**的
-// （只在首帧与"指示弧恰好扫过它"时重绘），几乎不占帧预算。
-#define ATZ_RPM_RING_REDZONE        1      // 0 = 不画红区刻度
-#define ATZ_RPM_RING_REDZONE_W      4      // 红区刻度线宽（px）
-#define ATZ_RPM_RING_REDZONE_GAP    3      // 与环内缘的间距（px）
-#define ATZ_RPM_RING_REDZONE_OPA    200    // 红区刻度不透明度 0~255
-// 取数节奏：主表就是 10Hz
-#define ATZ_RPM_RING_DATA_MS        100    // 从车况缓存取新目标值的周期（ms）
+// ── ③ 节奏 ────────────────────────────────────────────────────────────────
+#define ATZ_RPM_RING_DATA_MS        100    // 从车况缓存取新目标值的周期（ms）= 主表 10Hz
+#define ATZ_RPM_RING_TICK_MS        6      // 插值步进（6ms ≈ 166fps 上限；实测 ~83fps）
 #define ATZ_RPM_RING_STEP           20     // 死区（rpm）：目标变化小于这个值就不换目标
-// ★ 流畅度：**不用 lv_anim**。LVGL 的动画定时器周期由编译期的 LV_DEF_REFR_PERIOD 决定
-//   （本项目 = 33ms），动画最多 ~30fps 就到顶了 —— 实测 27~28fps 正是撞在这个天花板上。
-//   改成我们自己按 16ms 步进做插值（每步走剩余差的 1/3），就能跑到 ~60fps。
-#define ATZ_RPM_RING_TICK_MS        6      // 插值步进周期（6ms ≈ 166fps 上限；实测 ~90fps，见 21 号文档 5.5）
-#define ATZ_RPM_RING_PUSH_STEP      4      // 显示值变化不到这个数就不写控件（4rpm ≈ 0.18°，看不出来）
+#define ATZ_RPM_RING_PUSH_STEP      4      // 显示值变化不到这个数就不写控件
 // ★ 语音优先：设备**不在空闲状态**时（连接/聆听/说话），环的插值按这个分母降频。
 //   跑 12ms 全速时 LVGL 约占 25% CPU + 大量总线带宽，对话时降载能明显减少音频卡顿。
 //   设 1 = 不降频。

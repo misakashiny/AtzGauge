@@ -103,7 +103,7 @@ const PAGE = /* html */ `<!doctype html>
 
   <div>
     <div class="card">
-      <h2>设备屏幕（约 2 帧/秒）</h2>
+      <h2>设备屏幕（约 1 帧/秒）</h2>
       <img id="screen" alt="设备截屏">
       <div class="hint" id="shoterr"></div>
     </div>
@@ -184,7 +184,8 @@ function qs() {
 }
 async function injectOnce() {
   try {
-    const r = await fetch('/api/inject?' + qs(), { cache:'no-store' });
+    // seconds=2：告诉设备"这组值保持 2 秒"，设备内部 10Hz 复现 → 我们只要 3Hz 续命
+    const r = await fetch('/api/inject?' + qs() + '&seconds=2', { cache:'no-store' });
     const t = await r.text();
     if (!S.ok) { S.ok = true; setStatus(true); }
     if (!S.streaming) log('注入: ' + t.trim());
@@ -225,7 +226,7 @@ async function perf() {
 function startStream() {
   if (S.streaming) return;
   S.streaming = true;
-  S.timer = setInterval(injectOnce, 100);
+  S.timer = setInterval(injectOnce, 330);   // 3Hz 足够：设备内部会按 10Hz 复现（见 /inject 的 seconds 参数）
   $('stream').textContent = '⏸ 暂停实时流'; $('stream').classList.remove('primary');
   log('开始 10Hz 实时流');
 }
@@ -290,7 +291,7 @@ setInterval(() => {
   next.onload = () => { img.src = next.src; $('shoterr').textContent = ''; };
   next.onerror = () => { $('shoterr').textContent = '取不到截屏（设备离线？）'; };
   next.src = '/api/shot.jpg?device=' + encodeURIComponent(dev()) + '&t=' + Date.now();
-}, 500);
+}, 1000);   // 预览 1 帧/秒：再快只会白占设备 socket
 
 setInterval(() => { if (S.ok) perf(); }, 4000);
 paint();
@@ -334,6 +335,21 @@ const server = http.createServer(async (req, res) => {
     return proxy(res, `http://${device}:8099/inject?${q.toString()}`);
   }
   res.writeHead(404); res.end('not found');
+});
+
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error('');
+    console.error(`端口 ${PORT} 已被占用 —— 模拟台**已经在运行**了（多半是你又双击了一次）。`);
+    console.error(`本次不再启动第二个实例：多个实例会各自 10Hz 往设备发包，`);
+    console.error(`而设备一共只有 10 个 socket，会被打爆（现象：喊"小智"没反应）。`);
+    console.error(`直接打开已有的界面： http://127.0.0.1:${PORT}`);
+    if (OPEN) exec(`start "" http://127.0.0.1:${PORT}`, () => {});
+    setTimeout(() => process.exit(0), 800);
+    return;
+  }
+  console.error('启动失败:', e.message);
+  process.exit(1);
 });
 
 server.listen(PORT, '127.0.0.1', () => {

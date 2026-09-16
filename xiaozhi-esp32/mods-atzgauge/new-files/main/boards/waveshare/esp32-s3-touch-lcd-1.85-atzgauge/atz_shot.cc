@@ -214,6 +214,17 @@ void StartTask(void* arg) {
             config.ctrl_port = 32770;
             config.stack_size = 6144;   // 快照 + JPEG 编码的调用栈
             config.lru_purge_enable = true;
+            // ★★ socket 预算（2026-09-16 血的教训）★★
+            //   本机 lwIP 总共只有 CONFIG_LWIP_MAX_SOCKETS=10 个 socket，而它们要和
+            //   **与云端的 WebSocket/MQTT 连接**共用。PC 端模拟台按 10Hz 打 /inject 时，
+            //   httpd 默认要 7 个 socket，直接把这个池子吃光 → 串口报
+            //       E httpd: httpd_accept_conn: error in accept (23)      ← errno 23 = ENFILE
+            //   连云端连接都建不起来 → **喊"小智"没反应**（看着像"网络冲突"，其实是 socket 耗尽）。
+            //   所以调试用的这个服务只准占 2 个，永远给云连接留足。
+            config.max_open_sockets = 2;
+            config.keep_alive_enable = true;      // 复用连接，减少握手（也就少占 socket）
+            config.recv_wait_timeout = 5;
+            config.send_wait_timeout = 5;
             // ★ 必须 ≥ 实际注册的端点个数：httpd_register_uri_handler 超限时只返回
             //   ESP_ERR_HTTPD_HANDLERS_FULL，**不会**报错也不会崩，表现为该 URL 直接 404。
             //   （踩过一次：设 4 而注册了 5 个 → /touch 一直 404。）
@@ -496,6 +507,43 @@ esp_err_t SubtitleHandler(httpd_req_t* req) {
 //   · 全部可省略；volt 单位是 V（内部换算成 mV）
 //   · http://<设备IP>:8099/inject?stop=1   停止注入（2 秒后数据变"陈旧"，环归零变暗）
 //   安全提示：rpm ≥ 6500 会真的触发本地高转告警（会出声），这是设计行为。
+// ── 10Hz 重复注入（见 InjectHandler 里的说明）───────────────────────────────
+static uint16_t g_inj_rpm = 0;
+static uint8_t g_inj_speed = 0;
+static int16_t g_inj_coolant = 85, g_inj_oil = 95, g_inj_intake = 30, g_inj_load = 20, g_inj_tps = 10;
+static int32_t g_inj_bat_mv = 14200;
+static volatile int64_t g_inj_hold_until_us = 0;
+static bool g_inj_task_started = false;
+
+void InjectRepeaterTask(void* arg) {
+    (void)arg;
+    int tick = 0;
+    ESP_LOGI(TAG, "inject repeater task running (10Hz while hold is valid)");
+    while (true) {
+        tick++;
+        // 只在"确实在复现"时每 2 秒打一条，避免空闲时刷屏
+        if (tick % 20 == 0 && g_inj_hold_until_us != 0 &&
+            esp_timer_get_time() < g_inj_hold_until_us) {
+            const int64_t left = (g_inj_hold_until_us - esp_timer_get_time()) / 1000;
+            ESP_LOGI(TAG, "inject repeater: rpm=%u hold_left=%lld ms", (unsigned)g_inj_rpm,
+                     (long long)left);
+        }
+        if (g_inj_hold_until_us != 0 && esp_timer_get_time() < g_inj_hold_until_us) {
+            espnow_slave_inject_test_packet(g_inj_rpm, g_inj_speed, g_inj_coolant, g_inj_oil,
+                                            g_inj_intake, g_inj_load, g_inj_tps, g_inj_bat_mv);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));   // 10Hz，与真主表同频
+    }
+}
+
+void atz_inject_repeater_start(void) {
+    if (g_inj_task_started) {
+        return;
+    }
+    g_inj_task_started = true;
+    const BaseType_t ok = xTaskCreate(InjectRepeaterTask, "atz_inject", 4096, nullptr, 3, nullptr);
+    ESP_LOGI(TAG, "inject repeater start: %s", ok == pdPASS ? "ok" : "FAILED");
+}
 esp_err_t InjectHandler(httpd_req_t* req) {
     static uint16_t s_rpm = 0;
     static uint8_t s_speed = 0;
@@ -513,7 +561,8 @@ esp_err_t InjectHandler(httpd_req_t* req) {
     };
 
     if (getInt("stop", 0) != 0) {
-        atz_ui_car_inject_stop();
+        g_inj_hold_until_us = 0;                 // 停掉 10Hz 重复
+        atz_ui_car_inject_stop();                // 顺便停掉设备自带的模拟
         return httpd_resp_send(req, "ok: injection stopped (data goes stale in ~2 s)\n",
                                HTTPD_RESP_USE_STRLEN);
     }
@@ -530,8 +579,28 @@ esp_err_t InjectHandler(httpd_req_t* req) {
         s_bat_mv = (int32_t)(atof(value) * 1000.0f + 0.5f);
     }
 
+    // ★ 关键：**不在 HTTP 回调里注入一次就完事**，而是交给一个 10Hz 的重复任务。
+    //   为什么（2026-09-16 的坑）：设备总共只有 10 个 socket，还要和云端 WebSocket/MQTT 共用。
+    //   PC 端按 10Hz 直接打这个端点 → socket 被吃光 → 喊"小智"没反应。
+    //   现在 PC 只要 2~3Hz 续一次「保持时长」，设备内部按 10Hz 复现，数据流一样密，socket 少 3~5 倍。
+    g_inj_rpm = s_rpm;
+    g_inj_speed = s_speed;
+    g_inj_coolant = s_coolant;
+    g_inj_oil = s_oil;
+    g_inj_intake = s_intake;
+    g_inj_load = s_load;
+    g_inj_tps = s_tps;
+    g_inj_bat_mv = s_bat_mv;
+    const int hold_ms = getInt("seconds", 3) * 1000;      // 这次注入的有效期（默认 3 秒）
+    ESP_LOGI(TAG, "inject: rpm=%u hold=%d ms (task=%d)", (unsigned)s_rpm, hold_ms,
+             (int)g_inj_task_started);
+    g_inj_hold_until_us = esp_timer_get_time() + (int64_t)hold_ms * 1000;
+    atz_inject_repeater_start();                            // 首次调用时起任务，之后是空操作
     espnow_slave_inject_test_packet(s_rpm, s_speed, s_coolant, s_oil, s_intake, s_load, s_tps,
                                     s_bat_mv);
+    if (getInt("stop", 0) != 0) {
+        g_inj_hold_until_us = 0;
+    }
 
     char body[192];
     snprintf(body, sizeof(body),

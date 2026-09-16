@@ -41,7 +41,7 @@ namespace {
 
 Display* g_display = nullptr;
 lv_obj_t* g_arc = nullptr;          // 主环（底槽 + 指示弧）
-lv_obj_t* g_redzone = nullptr;      // 红区刻度（静态细弧，环内侧）
+lv_obj_t* g_bezel = nullptr;        // 最外沿细环（obd_brz_gauge 的 create_ring(page,10)）
 lv_timer_t* g_timer = nullptr;
 bool g_visible = true;              // 当前是否显示（打开车况页时临时隐藏）
 bool g_enabled = true;              // 用户开关（NVS 持久化，语音可控）
@@ -95,12 +95,30 @@ int ZoneIndex(int rpm) {
     return 0;
 }
 
+/** 底槽色：ATZ_RPM_RING_TRACK_COLOR 非 0 用固定色，否则跟随主题文字色。 */
+inline uint32_t TrackColor(void) {
+#if ATZ_RPM_RING_TRACK_COLOR != 0
+    return ATZ_RPM_RING_TRACK_COLOR;
+#else
+    return g_fg;
+#endif
+}
+
+/** 最外沿细环的颜色（obd_brz_gauge 用 UI_COLOR_RING）。 */
+inline uint32_t BezelColor(void) {
+#if ATZ_RPM_RING_BEZEL_COLOR != 0
+    return ATZ_RPM_RING_BEZEL_COLOR;
+#else
+    return g_fg;
+#endif
+}
+
 void StyleArc(void) {
     if (g_arc == nullptr) {
         return;
     }
     // 底槽：整圈，同色压暗（浅色主题下不会变成"看不见的白圈"）
-    lv_obj_set_style_arc_color(g_arc, lv_color_hex(g_fg), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(g_arc, lv_color_hex(TrackColor()), LV_PART_MAIN);
     lv_obj_set_style_arc_opa(g_arc, (lv_opa_t)ATZ_RPM_RING_TRACK_OPA, LV_PART_MAIN);
     lv_obj_set_style_arc_width(g_arc, ATZ_RPM_RING_W, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(g_arc, ATZ_RPM_RING_ROUNDED != 0, LV_PART_MAIN);
@@ -113,6 +131,20 @@ void StyleArc(void) {
     lv_obj_set_style_bg_opa(g_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_pad_all(g_arc, 0, LV_PART_KNOB);
     lv_obj_set_style_border_width(g_arc, 0, LV_PART_KNOB);
+}
+
+void StyleBezel(void) {
+    if (g_bezel == nullptr) {
+        return;
+    }
+    lv_obj_set_style_arc_color(g_bezel, lv_color_hex(BezelColor()), LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(g_bezel, (lv_opa_t)ATZ_RPM_RING_BEZEL_OPA, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_bezel, ATZ_RPM_RING_BEZEL_W, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(g_bezel, false, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(g_bezel, LV_OPA_TRANSP, LV_PART_INDICATOR);   // 只要整圈，不要指示段
+    lv_obj_set_style_bg_opa(g_bezel, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(g_bezel, 0, LV_PART_KNOB);
+    lv_obj_set_style_border_width(g_bezel, 0, LV_PART_KNOB);
 }
 
 // 只在必要时写 LVGL：静止时一次重绘都不做（死区 ATZ_RPM_RING_STEP）。
@@ -265,7 +297,7 @@ void atz_rpm_ring_init(Display* display) {
         lv_display_add_event_cb(disp, DisplayEventCb, LV_EVENT_RENDER_READY, nullptr);
     }
 
-    // ── 唯一的一个环 ──────────────────────────────────────────────────────
+    // ── ② 转速弧（obd_brz_gauge 的 ui_RpmPageArcRpmBack：340×340 / width 20 / 直角）──
     g_arc = lv_arc_create(screen);
     lv_obj_set_size(g_arc, ATZ_RPM_RING_D, ATZ_RPM_RING_D);
     lv_obj_align(g_arc, LV_ALIGN_CENTER, 0, 0);
@@ -287,36 +319,21 @@ void atz_rpm_ring_init(Display* display) {
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
-#if ATZ_RPM_RING_REDZONE
-    // ── 红区刻度：环**内侧**一条静态细弧（标出红线区）──────────────────────
-    // 半径 = 环内缘 − 间距 − 线宽/2；角度用与主环同一套约定（bg_angles 从 0 开始增长）。
-    {
-        const int ring_inner = ATZ_RPM_RING_D / 2 - ATZ_RPM_RING_W;      // 154
-        const int rz_radius = ring_inner - ATZ_RPM_RING_REDZONE_GAP - ATZ_RPM_RING_REDZONE_W / 2;
-        const int start_deg =
-            (int)((int64_t)ATZ_RPM_RING_ALARM_RPM * 360 / ATZ_RPM_RING_MAX_RPM + 0.5);
-        g_redzone = lv_arc_create(screen);
-        lv_obj_set_size(g_redzone, rz_radius * 2, rz_radius * 2);
-        lv_obj_align(g_redzone, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_clear_flag(g_redzone, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_clear_flag(g_redzone, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_FLOATING);   // 同主环：别撑出屏幕滚动条
-        lv_arc_set_rotation(g_redzone, 90);
-        lv_arc_set_bg_angles(g_redzone, start_deg, 360);
-        lv_arc_set_range(g_redzone, 0, 100);
-        lv_arc_set_value(g_redzone, 0);                     // 只要底槽那段，不要指示弧
-        lv_obj_set_style_arc_color(g_redzone, lv_color_hex(kColorAlarm), LV_PART_MAIN);
-        lv_obj_set_style_arc_opa(g_redzone, (lv_opa_t)ATZ_RPM_RING_REDZONE_OPA, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(g_redzone, ATZ_RPM_RING_REDZONE_W, LV_PART_MAIN);
-        lv_obj_set_style_arc_rounded(g_redzone, true, LV_PART_MAIN);
-        lv_obj_set_style_arc_opa(g_redzone, LV_OPA_TRANSP, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_opa(g_redzone, LV_OPA_TRANSP, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(g_redzone, 0, LV_PART_KNOB);
-        lv_obj_set_style_border_width(g_redzone, 0, LV_PART_KNOB);
-        lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);     // 先藏，等确认开关状态
-    }
+#if ATZ_RPM_RING_BEZEL
+    // ── ① 最外沿细环（obd_brz_gauge 的 ui_helpers_create_ring(page, 10)）────────
+    // 直径 360 = 屏幕边（LVGL 弧从半径往内画，所以外缘正好贴死），线宽 10 → 占半径 170~180。
+    g_bezel = lv_arc_create(screen);
+    lv_obj_set_size(g_bezel, ATZ_RPM_RING_BEZEL_D, ATZ_RPM_RING_BEZEL_D);
+    lv_obj_align(g_bezel, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(g_bezel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_bezel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_bezel, LV_OBJ_FLAG_FLOATING);   // 别把屏幕撑出滚动条（缺陷 #21）
+    lv_arc_set_rotation(g_bezel, 90);
+    lv_arc_set_bg_angles(g_bezel, 0, 360);
+    lv_arc_set_range(g_bezel, 0, 100);
+    lv_arc_set_value(g_bezel, 0);
+    StyleBezel();
 #endif
-
     // 画在最前面：上游的 container_ 是不透明底，藏在它后面就看不见了（红区在主环之下）
     lv_obj_move_foreground(g_arc);
 
@@ -333,11 +350,11 @@ void atz_rpm_ring_init(Display* display) {
 
     ESP_LOGI(TAG, "rpm ring ready: d=%d w=%d (outer r=%d = screen edge), full scale=%d rpm "
                   "(warn %d / alarm %d), data %d ms, tick %d ms, push step %d rpm, "
-                  "rounded=%d redzone=%d enabled=%d",
+                  "rounded=%d bezel=%d enabled=%d",
              ATZ_RPM_RING_D, ATZ_RPM_RING_W, ATZ_RPM_RING_D / 2, ATZ_RPM_RING_MAX_RPM,
              ATZ_RPM_RING_WARN_RPM, ATZ_RPM_RING_ALARM_RPM, ATZ_RPM_RING_DATA_MS,
              ATZ_RPM_RING_TICK_MS, ATZ_RPM_RING_PUSH_STEP, ATZ_RPM_RING_ROUNDED,
-             ATZ_RPM_RING_REDZONE, (int)g_enabled);
+             ATZ_RPM_RING_BEZEL, (int)g_enabled);
 }
 
 // 语音开关（写 NVS，重启仍生效）。关闭时把环和红区刻度一起藏掉，并停掉插值。
@@ -351,17 +368,17 @@ void atz_rpm_ring_set_enabled(bool on) {
     if (show) {
         lv_obj_remove_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_arc);
-#if ATZ_RPM_RING_REDZONE
-        if (g_redzone != nullptr) {
-            lv_obj_remove_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_BEZEL
+        if (g_bezel != nullptr) {
+            lv_obj_remove_flag(g_bezel, LV_OBJ_FLAG_HIDDEN);
         }
 #endif
         RingTimerCb(nullptr);   // 立刻补一帧
     } else {
         lv_obj_add_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
-#if ATZ_RPM_RING_REDZONE
-        if (g_redzone != nullptr) {
-            lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_BEZEL
+        if (g_bezel != nullptr) {
+            lv_obj_add_flag(g_bezel, LV_OBJ_FLAG_HIDDEN);
         }
 #endif
     }
@@ -387,17 +404,17 @@ void atz_rpm_ring_set_visible(bool visible) {
     if (visible && g_enabled) {
         lv_obj_remove_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_arc);
-#if ATZ_RPM_RING_REDZONE
-        if (g_redzone != nullptr) {
-            lv_obj_remove_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_BEZEL
+        if (g_bezel != nullptr) {
+            lv_obj_remove_flag(g_bezel, LV_OBJ_FLAG_HIDDEN);
         }
 #endif
         RingTimerCb(nullptr);              // 立刻补一帧，别显示旧值
     } else {
         lv_obj_add_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
-#if ATZ_RPM_RING_REDZONE
-        if (g_redzone != nullptr) {
-            lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_BEZEL
+        if (g_bezel != nullptr) {
+            lv_obj_add_flag(g_bezel, LV_OBJ_FLAG_HIDDEN);
         }
 #endif
     }
@@ -414,6 +431,7 @@ void atz_rpm_ring_apply_theme(uint32_t fg_rgb) {
     }
     DisplayLockGuard lock(g_display);
     StyleArc();
+    StyleBezel();
     g_last_zone = -1;   // 强制下一帧重写指示弧颜色
     RingTimerCb(nullptr);
 }
