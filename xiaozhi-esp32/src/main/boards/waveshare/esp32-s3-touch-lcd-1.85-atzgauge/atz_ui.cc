@@ -20,6 +20,7 @@
 #include "settings.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -263,6 +264,20 @@ void AtzLcdDisplay::SetupUI() {
     SetStockSubtitleVisible(false);
 #endif
 
+    // 字幕冻结轮询：见 TickSubtitleFreeze() 的说明（省掉空闲时 ~14% CPU）
+#if ATZ_SUBTITLE_FREEZE
+    if (subtitle_timer_ == nullptr) {
+        subtitle_timer_ = lv_timer_create(
+            [](lv_timer_t* t) {
+                auto* self = static_cast<AtzLcdDisplay*>(lv_timer_get_user_data(t));
+                if (self != nullptr) {
+                    self->TickSubtitleFreeze();
+                }
+            },
+            ATZ_SUBTITLE_POLL_MS, this);
+    }
+#endif
+
 #if ATZ_UI_ENABLE && ATZ_UI_CAR_BAR_ENABLE
     BuildCarBar();
 
@@ -425,6 +440,44 @@ size_t AtzLcdDisplay::CopyChatText(char* buf, size_t len) {
     }
     snprintf(buf, len, "%s", text);
     return strlen(buf);
+}
+
+// ── 字幕冻结（省 CPU）────────────────────────────────────────────────────────
+// 上游字幕是 LV_LABEL_LONG_SCROLL_CIRCULAR：**文本比框宽就永远滚**。
+// 实测：光这一项就让设备空闲时也跑 28fps（≈14% CPU 常年白烧）。
+// 做法：字幕一变就恢复滚动并重新计时；超过 ATZ_SUBTITLE_ROLL_MS 切到 CLIP（停住）。
+void AtzLcdDisplay::TickSubtitleFreeze() {
+#if ATZ_SUBTITLE_FREEZE
+    DisplayLockGuard lock(this);
+    if (chat_message_label_ == nullptr) {
+        return;
+    }
+    const char* text = lv_label_get_text(chat_message_label_);
+    const bool has_text = (text != nullptr && text[0] != '\0');
+
+    if (!has_text) {
+        // 清空时把模式复位，否则下一条字幕会继承 CLIP（踩过：新字幕不滚，等于冻结功能失灵）
+        if (subtitle_frozen_) {
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            subtitle_frozen_ = false;
+        }
+        subtitle_seen_[0] = '\0';
+        return;
+    }
+    if (strcmp(text, subtitle_seen_) != 0) {
+        snprintf(subtitle_seen_, sizeof(subtitle_seen_), "%s", text);   // 新字幕
+        subtitle_freeze_at_ms_ = (int64_t)(esp_timer_get_time() / 1000) + ATZ_SUBTITLE_ROLL_MS;
+        // ★ 无条件恢复滚动模式（不能只在 subtitle_frozen_ 为真时恢复：
+        //   中间可能经历过"字幕被清空"，那时模式已经是 CLIP 了）
+        lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        subtitle_frozen_ = false;
+        return;
+    }
+    if (!subtitle_frozen_ && esp_timer_get_time() / 1000 >= subtitle_freeze_at_ms_) {
+        subtitle_frozen_ = true;
+        lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_CLIP);   // 停住，不再滚动
+    }
+#endif
 }
 
 void AtzLcdDisplay::SetStockSubtitleVisible(bool visible) {

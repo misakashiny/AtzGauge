@@ -15,6 +15,7 @@
 //   或双击 tools\sim-console.cmd
 import http from 'node:http';
 import { exec } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
 function arg(name, dflt) {
@@ -22,6 +23,17 @@ function arg(name, dflt) {
   return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
 }
 const DEVICE = arg('device', '192.168.5.129');
+// 调试端点鉴权 token：直接读板型配置头，免得手工同步（读不到就用默认值）
+function readDebugToken() {
+  const p = 'D:\\\\AtzGauge\\\\xiaozhi-esp32\\\\src\\\\main\\\\boards\\\\waveshare\\\\esp32-s3-touch-lcd-1.85-atzgauge\\\\atz_ui_config.h';
+  try {
+    const txt = readFileSync(p, 'utf8');
+    const m = txt.match(/#define\s+ATZ_DEBUG_TOKEN\s+"([^"]*)"/);
+    if (m && m[1]) return m[1];
+  } catch { /* 源码不在本机就退回默认 */ }
+  return 'atz-2026';
+}
+const KEY = arg('key', readDebugToken());
 const PORT = Number(arg('port', '8123'));
 const OPEN = !argv.includes('--no-open');
 
@@ -328,10 +340,11 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === '/api/health') return proxy(res, `http://${device}:8099/health`);
   if (u.pathname === '/api/perf')   return proxy(res, `http://${device}:8099/perf?seconds=${u.searchParams.get('seconds') || 2}`);
   if (u.pathname === '/api/shot.jpg') return proxy(res, `http://${device}:8099/shot.jpg?t=${Date.now()}`, true);
-  if (u.pathname === '/api/stop')   return proxy(res, `http://${device}:8099/inject?stop=1`);
+  if (u.pathname === '/api/stop')   return proxy(res, `http://${device}:8099/inject?stop=1&key=${KEY}`);
   if (u.pathname === '/api/inject') {
     const q = new URLSearchParams(u.searchParams);
     q.delete('device');
+    q.set('key', KEY);                 // 写操作鉴权（设备端 ATZ_DEBUG_TOKEN）
     return proxy(res, `http://${device}:8099/inject?${q.toString()}`);
   }
   res.writeHead(404); res.end('not found');

@@ -6,7 +6,8 @@
         {
             "name": "esp32-s3-touch-lcd-1.85-atzgauge",
             "sdkconfig_append": [
-                "CONFIG_FREERTOS_HZ=1000"
+                "CONFIG_FREERTOS_HZ=1000",
+                "CONFIG_LWIP_MAX_SOCKETS=16"
             ]
         }
     ]

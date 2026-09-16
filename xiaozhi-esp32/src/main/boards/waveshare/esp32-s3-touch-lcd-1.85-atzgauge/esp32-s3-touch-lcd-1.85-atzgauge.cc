@@ -19,6 +19,7 @@
 #include "atz_shot.h"
 // 「车况」整屏页面（语音进入）。见 atz_car_page.h。
 #include "atz_car_page.h"
+#include "atz_dim.h"
 #include "settings.h"
 
 #include <esp_log.h>
@@ -809,6 +810,8 @@ public:
 
         RaiseLvglTaskPriority();
         TuneLvglRefreshPeriod();
+
+        atz_dim_init(display_);   // 自动调光：空闲/夜间降亮（只动背光，详见 atz_dim.cc）
     }
 
     // 上游把 LVGL 渲染任务（esp_lvgl_port 的 "taskLVGL"）建在**最低优先级 1**，
@@ -962,6 +965,7 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
         if (down) {
             if (!latched && ++down_samples >= TP_CONFIRM_SAMPLES) {
                 latched = true;
+                atz_dim_kick();   // 有人碰屏幕 = 有交互 → 立刻恢复全亮
                 DeviceState state = app.GetDeviceState();
                 if (state == kDeviceStateIdle) {
                     ESP_LOGI(TAG, "touch tap -> start conversation");

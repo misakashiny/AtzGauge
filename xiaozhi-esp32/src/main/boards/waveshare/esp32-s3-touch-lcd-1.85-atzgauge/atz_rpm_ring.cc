@@ -16,6 +16,7 @@
 
 #include "application.h"
 #include "atz_ui_config.h"
+#include "car_alarm.h"
 #include "display.h"
 #include "espnow_link.h"
 #include "obd_data_cache.h"
@@ -48,6 +49,13 @@ bool g_enabled = true;              // 用户开关（NVS 持久化，语音可�
 uint32_t g_fg = 0xFFFFFF;        // 默认按深色主题（黑底白环）
 int g_last_zone = -1;
 bool g_last_stale = false;
+
+// 视觉告警状态（轮询 car_alarm_active()，见 ATZ_ALERT_*）
+int64_t g_alert_until_us = 0;      // 闪到什么时候
+int64_t g_alert_grace_us = 0;      // 告警解除后的余辉截止
+bool g_alert_on = false;           // 当前这一拍是不是"红"
+car_alarm_id_t g_alert_last_id = CAR_ALARM_NONE;
+int g_alert_signalled = -1;        // 上一次已提示的告警 id（-1 = 还没提示过）
 
 // 插值状态（见下面 RingTimerCb 的说明）
 int g_disp_value = 0;          // 当前**画在屏上**的值（插值中间值）
@@ -133,6 +141,17 @@ void StyleArc(void) {
     lv_obj_set_style_border_width(g_arc, 0, LV_PART_KNOB);
 }
 
+/** 视觉告警一拍：on = 染成告警红，off = 恢复主题色。 */
+void SetBezelAlert(bool on) {
+    if (g_bezel == nullptr) {
+        return;
+    }
+    lv_obj_set_style_arc_color(g_bezel,
+                               lv_color_hex(on ? (uint32_t)ATZ_ALERT_COLOR : BezelColor()),
+                               LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(g_bezel, (lv_opa_t)ATZ_RPM_RING_BEZEL_OPA, LV_PART_MAIN);
+}
+
 void StyleBezel(void) {
     if (g_bezel == nullptr) {
         return;
@@ -170,9 +189,48 @@ void RingTimerCb(lv_timer_t* timer) {
     //   开车时用户不会同时跟小智聊天，所以这个降载在体验上察觉不到。
     static uint32_t s_tick = 0;
     s_tick++;
-    if ((s_tick % ATZ_RPM_RING_BUSY_DIV) != 0) {
-        const bool idle_now = (Application::GetInstance().GetDeviceState() == kDeviceStateIdle);
-        if (!idle_now) {
+    const bool idle_now = (Application::GetInstance().GetDeviceState() == kDeviceStateIdle);
+    if (!idle_now && (s_tick % ATZ_RPM_RING_BUSY_DIV) != 0) {
+        return;
+    }
+
+#if ATZ_ALERT_FLASH_ENABLE
+    // ── 视觉告警：轮询告警模块（不改它，只读它的公开状态）────────────────
+    // 有活动告警 → 外沿细环按 ATZ_ALERT_FLASH_HZ 在"告警红 ↔ 主题色"之间闪；
+    // 告警解除后再补闪 ATZ_ALERT_GRACE_MS，避免一闪而过没注意到。
+    if (g_bezel != nullptr && (s_tick % (1000 / ATZ_RPM_RING_TICK_MS / 4)) == 0) {
+        const car_alarm_id_t id = car_alarm_active();
+        const int64_t now_us = esp_timer_get_time();
+        if (id != CAR_ALARM_NONE) {
+            if ((int)id != g_alert_signalled) {
+                g_alert_signalled = (int)id;
+                g_alert_until_us = now_us + (int64_t)ATZ_ALERT_FLASH_MS * 1000;
+                ESP_LOGW(TAG, "visual alert: ring flashing (%s)", car_alarm_name(id));
+            }
+            g_alert_grace_us = now_us + (int64_t)ATZ_ALERT_GRACE_MS * 1000;
+        }
+        const bool active = (now_us < g_alert_until_us) || (now_us < g_alert_grace_us);
+        if (!active && g_alert_on) {
+            g_alert_on = false;
+            SetBezelAlert(false);
+            g_alert_signalled = -1;
+        } else if (active) {
+            const int64_t half_period_us = 1000000 / (ATZ_ALERT_FLASH_HZ * 2);
+            const bool on = ((now_us / half_period_us) % 2) != 0;
+            if (on != g_alert_on) {
+                g_alert_on = on;
+                SetBezelAlert(on);
+            }
+        }
+    }
+#endif
+
+    // ── 动态帧率：变化慢就没必要每 6ms 插值一次 ──────────────────────────
+    //   实测扫掠（转速飞变）83fps 占 ~66% CPU；缓慢漂移时降到 1/3 帧率完全看不出差别。
+    if (idle_now) {
+        const int gap = (g_target_value > g_disp_value) ? (g_target_value - g_disp_value)
+                                                        : (g_disp_value - g_target_value);
+        if (gap < ATZ_RPM_RING_SLOW_DELTA && (s_tick % ATZ_RPM_RING_SLOW_DIV) != 0) {
             return;
         }
     }

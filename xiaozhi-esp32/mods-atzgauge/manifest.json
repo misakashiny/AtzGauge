@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-16T14:11:30.420Z",
+  "generatedAt": "2026-09-16T14:36:09.231Z",
   "baseline": "78/xiaozhi-esp32 v2.5.0 (codeload tar.gz)",
   "currentTree": "D:/AtzGauge/xiaozhi-esp32/src",
   "upstreamTree": "D:/AtzGauge/upstream/xiaozhi-esp32-2.5.0",
@@ -12,6 +12,8 @@
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_arc_text.h",
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_car_page.cc",
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_car_page.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_dim.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_dim.h",
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_rpm_ring.cc",
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_rpm_ring.h",
     "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_shot.cc",

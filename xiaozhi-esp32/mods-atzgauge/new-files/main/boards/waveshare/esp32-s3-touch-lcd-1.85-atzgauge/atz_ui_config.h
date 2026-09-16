@@ -270,6 +270,54 @@
 #define ATZ_ARC_TEXT_POLL_MS        200    // 轮询上游字幕文本的周期（变了才重排）
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 9. 省电与观感（2026-09-16 优化）
+//
+// 9.1 字幕冻结：上游字幕是 LONG_SCROLL_CIRCULAR —— **文本比框宽就永远滚**。
+//     实测：光这一项就让设备在空闲时也跑 28fps（≈14% CPU 常年白烧）。
+//     现在：新字幕先滚 N 毫秒（够看清），之后切成长度裁剪模式停住；来了新字幕再解冻。
+#define ATZ_SUBTITLE_FREEZE         1      // 0 = 保持上游行为（一直滚）
+#define ATZ_SUBTITLE_ROLL_MS        8000   // 每条字幕允许滚动多久（ms）
+#define ATZ_SUBTITLE_POLL_MS        500    // 检查字幕是否变化的周期（ms）
+
+// 9.2 动态帧率：转速变化慢时没必要 166Hz 地插值。
+//     实测扫掠（转速飞变）时 83fps 占 ~66% CPU；缓慢漂移时降到 1/3 帧率完全看不出来。
+#define ATZ_RPM_RING_SLOW_DELTA     150    // 目标与显示值相差小于这个（rpm）就算"慢"
+#define ATZ_RPM_RING_SLOW_DIV       3      // 慢的时候每 N 个 tick 才插值一次
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. 视觉告警（车上噪声大，声音告警常常听不见 → 屏幕也要给信号）
+//     实现：轮询 car_alarm_active()，有活动告警时让**外沿细环闪红**（3Hz），
+//     告警解除后再多闪一段时间（余辉），避免一闪而过没注意。
+// ═══════════════════════════════════════════════════════════════════════════
+#define ATZ_ALERT_FLASH_ENABLE      1      // 0 = 关闭视觉告警
+#define ATZ_ALERT_FLASH_MS          15000  // 单次告警最多闪这么久（ms）
+#define ATZ_ALERT_GRACE_MS          3000   // 告警解除后补闪（ms）
+#define ATZ_ALERT_POLL_MS           250    // 轮询告警状态的周期（ms）
+#define ATZ_ALERT_FLASH_HZ          3      // 闪烁频率（Hz）
+#define ATZ_ALERT_COLOR             0xFF3B30   // 闪烁色（与告警红一致）
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11. 自动调光（夜间/长时间无交互时不要一直全亮）
+#define ATZ_DIM_ENABLE              1      // 0 = 不自动调光
+#define ATZ_DIM_AFTER_S             120    // 连续这么久没有交互（且不在对话）就降亮
+#define ATZ_DIM_PCT                 20     // 降到的亮度百分比
+#define ATZ_DIM_POLL_MS             1000   // 检查周期（ms）
+// 夜间再暗一档（需要 NTP 时间；不联网就退化成只用上面的空闲降亮）
+#define ATZ_DIM_NIGHT_ENABLE        1
+#define ATZ_DIM_NIGHT_FROM_HOUR     22     // 22:00 起
+#define ATZ_DIM_NIGHT_TO_HOUR       6      // 到 06:00
+#define ATZ_DIM_NIGHT_PCT           10     // 夜间的降亮目标
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. 调试端点鉴权（防同网段随手乱改，不是强安全措施）
+//     写操作（/theme /carbar /carpage /size /inject /ring /subtitle）要求带
+//       &key=<ATZ_DEBUG_TOKEN>
+//     只读端点（/health /shot.jpg /layout /perf /touch）不受影响。
+//     token 会打印在串口启动日志里；PC 端模拟台会自动从本文件读它。
+//     想彻底关掉调试服务：把 ATZ_UI_SHOT_SERVER_ENABLE 置 0。
+#define ATZ_DEBUG_AUTH              1      // 1 = 写操作校验 token
+#define ATZ_DEBUG_TOKEN             "atz-2026"   // 改这里即可；工具会自动读取
+// ═══════════════════════════════════════════════════════════════════════════
 // 8. 台架注入的硬上限
 //    教训（2026-09-16）：模拟一旦启动就一直在注入假数据，设备看起来"停不下来"。
 //    现在有两条路停车：① 到点自动停 ② `/carbar?mode=stop` 或语音 mode="stop" 立即停。

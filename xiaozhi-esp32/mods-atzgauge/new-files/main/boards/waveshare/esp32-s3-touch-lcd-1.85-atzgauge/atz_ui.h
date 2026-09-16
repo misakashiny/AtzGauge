@@ -132,6 +132,14 @@ private:
     /** 按 NVS/宏的设置显示或隐藏顶栏图标（要求已持有显示锁） */
     void ApplyStatusIconVisibilities();
 
+    /** 字幕冻结轮询（自己加显示锁，跑在 lv_timer 里） */
+    void TickSubtitleFreeze();
+
+    lv_timer_t* subtitle_timer_ = nullptr;
+    int64_t subtitle_freeze_at_ms_ = 0;
+    bool subtitle_frozen_ = false;
+    char subtitle_seen_[160] = {0};
+
     /** 把当前主题的文字色套到屏幕外沿的转速圈上（要求已持有显示锁） */
     void ApplyRingTheme();
 };

@@ -41,6 +41,89 @@ esp_err_t SubtitleHandler(httpd_req_t* req);
 esp_err_t InjectHandler(httpd_req_t* req);
 esp_err_t RingHandler(httpd_req_t* req);
 
+// ── 调试端点鉴权 ────────────────────────────────────────────────────────────
+// 只给"写操作"加锁：/theme /carbar /carpage /size /inject /ring /subtitle。
+// 只读端点（/health /shot.jpg /layout /perf /touch）不校验，方便随时探活。
+// 这不是强安全措施（token 是明文常量、串口日志里也有），只是挡住"同网段随手乱改"。
+bool WriteAllowed(httpd_req_t* req) {
+#if ATZ_DEBUG_AUTH
+    char query[256] = {};
+    char key[64] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    if (httpd_query_key_value(query, "key", key, sizeof(key)) != ESP_OK) {
+        return false;
+    }
+    return strcmp(key, ATZ_DEBUG_TOKEN) == 0;
+#else
+    (void)req;
+    return true;
+#endif
+}
+
+/** 鉴权失败时统一回一句话（并告诉调用方别再往下走）。 */
+esp_err_t DenyWrite(httpd_req_t* req) {
+    return httpd_resp_send(req,
+                           "denied: write endpoints need &key=<ATZ_DEBUG_TOKEN>\n"
+                           "(token is printed in the device boot log; see atz_ui_config.h)\n",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
+// ── /perf 的非阻塞采样器 ────────────────────────────────────────────────────
+// ★ 以前 /perf 是"在 HTTP 回调里 vTaskDelay(N 秒) 再统计" —— 那会把 1/2 个 socket
+//   占死 N 秒，别的调试请求全被拒。现在改成后台任务持续采样 2 秒窗口，
+//   端点只把**上一次算好的结果**立刻返回（带窗口与新鲜度）。
+struct PerfSample {
+    uint32_t fps_x10;
+    uint32_t avg_us;
+    uint32_t avg_px;
+    uint32_t peak_px;
+    uint32_t calls;
+    uint32_t pushes;
+    uint32_t frames;
+    int64_t at_ms;
+};
+PerfSample g_perf = {};
+bool g_perf_task_started = false;
+
+void PerfSamplerTask(void* arg) {
+    (void)arg;
+    const int window_ms = 2000;
+    for (;;) {
+        uint32_t f0 = 0, c0 = 0, p0 = 0, im0 = 0;
+        uint64_t b0 = 0, px0 = 0, w0 = 0;
+        atz_rpm_ring_perf_read(&f0, &b0, &c0, &p0);
+        atz_rpm_ring_perf_ext(&w0, &px0, &im0);
+
+        vTaskDelay(pdMS_TO_TICKS(window_ms));
+
+        uint32_t f1 = 0, c1 = 0, p1 = 0, im1 = 0;
+        uint64_t b1 = 0, px1 = 0, w1 = 0;
+        atz_rpm_ring_perf_read(&f1, &b1, &c1, &p1);
+        atz_rpm_ring_perf_ext(&w1, &px1, &im1);
+        const uint32_t frames = f1 - f0;
+        const uint64_t busy = b1 - b0;
+        const uint64_t px = px1 - px0;
+        g_perf.frames = frames;
+        // fps_x10 = 帧数 / 窗口秒数 * 10；窗口 2000ms 时 = frames * 10 / 2
+        g_perf.fps_x10 = (uint32_t)((uint64_t)frames * 10000 / window_ms);
+        g_perf.avg_us = frames ? (uint32_t)(busy / frames) : 0;
+        g_perf.avg_px = frames ? (uint32_t)(px / frames) : 0;
+        g_perf.peak_px = im1;
+        g_perf.calls = c1 - c0;
+        g_perf.pushes = p1 - p0;
+        g_perf.at_ms = esp_timer_get_time() / 1000;
+    }
+}
+
+void PerfSamplerStart(void) {
+    if (g_perf_task_started) {
+        return;
+    }
+    g_perf_task_started = true;
+    xTaskCreate(PerfSamplerTask, "atz_perf", 4096, nullptr, 2, nullptr);
+}
 // 递归 dump 控件树（/layout 用）。class 用指针比对，避免依赖 LVGL 内部类的字段。
 void DumpObjTree(lv_obj_t* obj, int depth, char* out, size_t len, size_t* used) {
     if (obj == nullptr || *used + 96 >= len) {
@@ -162,7 +245,8 @@ esp_err_t HealthHandler(httpd_req_t* req) {
              "switches: ATZ_UI_ENABLE=%d rpm_ring=%d arc_text=%d wifi_icon=%d\n"
              "uptime=%lu s  heap=%lu B\n",
              ATZ_FW_NAME, ATZ_FW_STAGE, ATZ_FW_BUILT, ATZ_UI_ENABLE, ATZ_RPM_RING_ENABLE,
-             ATZ_ARC_TEXT_ENABLE, ATZ_SHOW_NETWORK_ICON, (unsigned long)(esp_timer_get_time() / 1000000),
+             ATZ_ARC_TEXT_ENABLE, ATZ_SHOW_NETWORK_ICON,
+             (unsigned long)(esp_timer_get_time() / 1000000),
              (unsigned long)esp_get_free_heap_size());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
@@ -171,6 +255,9 @@ esp_err_t HealthHandler(httpd_req_t* req) {
 //   http://<设备IP>:8099/theme?name=atz-day
 // 主题名会被写进 NVS（Display::SetTheme 的行为），所以和语音切换等价。
 esp_err_t ThemeHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     if (g_display == nullptr) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no display");
         return ESP_FAIL;
@@ -221,7 +308,7 @@ void StartTask(void* arg) {
             //       E httpd: httpd_accept_conn: error in accept (23)      ← errno 23 = ENFILE
             //   连云端连接都建不起来 → **喊"小智"没反应**（看着像"网络冲突"，其实是 socket 耗尽）。
             //   所以调试用的这个服务只准占 2 个，永远给云连接留足。
-            config.max_open_sockets = 2;
+            config.max_open_sockets = 3;   // 3 个够用（快照/查询/注入各一），仍给云连接留足
             config.keep_alive_enable = true;      // 复用连接，减少握手（也就少占 socket）
             config.recv_wait_timeout = 5;
             config.send_wait_timeout = 5;
@@ -355,6 +442,9 @@ void StartTask(void* arg) {
 //   http://<设备IP>:8099/carbar?seconds=30&mode=rev      转速扫掠：怠速→拉转速→换挡→再拉→回怠速
 //   http://<设备IP>:8099/carbar?seconds=30&mode=redline  同上但峰值 7000 转（越过红线，会出声告警）
 esp_err_t CarBarHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     char query[96] = {};
     char value[16] = {};
     int seconds = 15;
@@ -403,6 +493,9 @@ esp_err_t TouchHandler(httpd_req_t* req) {
 //   http://<设备IP>:8099/carpage?fields=rpm,coolant   只显示这几项（all = 全部）
 //   http://<设备IP>:8099/carpage?on=intake&off=load   单项开关（等价于语音 set_car_page_field）
 esp_err_t CarPageHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     char query[192] = {};
     char value[128] = {};
     const char* action = "show";
@@ -482,6 +575,9 @@ void UrlDecode(char* s) {
 // 台架用：往字幕里塞一句话，用来验证「逐字贴弧」排版（不改上游代码）。
 //   http://<设备IP>:8099/subtitle?text=你好我是小智   （中文请 URL 编码）
 esp_err_t SubtitleHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     char query[512] = {};
     char value[240] = {};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
@@ -545,6 +641,9 @@ void atz_inject_repeater_start(void) {
     ESP_LOGI(TAG, "inject repeater start: %s", ok == pdPASS ? "ok" : "FAILED");
 }
 esp_err_t InjectHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     static uint16_t s_rpm = 0;
     static uint8_t s_speed = 0;
     static int16_t s_coolant = 85, s_oil = 95, s_intake = 30, s_load = 20, s_tps = 10;
@@ -614,6 +713,9 @@ esp_err_t InjectHandler(httpd_req_t* req) {
 //   http://<设备IP>:8099/ring            查询
 //   http://<设备IP>:8099/ring?enabled=0  关掉（写 NVS，重启仍生效）
 esp_err_t RingHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     char query[48] = {};
     char value[16] = {};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
@@ -633,63 +735,33 @@ esp_err_t RingHandler(httpd_req_t* req) {
 // 为什么要有这个：环的包围盒是 340×340，中间压着带缩放的表情图，每重绘一次都很贵；
 // 没有数字就只能猜（"是不是 CPU 不够""是不是缓冲区太小"）。
 esp_err_t PerfHandler(httpd_req_t* req) {
-    char query[64] = {};
-    char value[16] = {};
-    int seconds = 5;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "seconds", value, sizeof(value)) == ESP_OK) {
-        seconds = atoi(value);
-    }
-    if (seconds < 1) {
-        seconds = 1;
-    }
-    if (seconds > 20) {
-        seconds = 20;
-    }
-
-    uint32_t f0 = 0, c0 = 0, p0 = 0;
-    uint64_t b0 = 0, w0 = 0, px0 = 0;
-    uint32_t im0 = 0;
-    atz_rpm_ring_perf_read(&f0, &b0, &c0, &p0);
-    atz_rpm_ring_perf_ext(&w0, &px0, &im0);
-    vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
-    uint32_t f1 = 0, c1 = 0, p1 = 0;
-    uint64_t b1 = 0, w1 = 0, px1 = 0;
-    uint32_t im1 = 0;
-    atz_rpm_ring_perf_read(&f1, &b1, &c1, &p1);
-    atz_rpm_ring_perf_ext(&w1, &px1, &im1);
-
-    const uint32_t frames = f1 - f0;
-    const uint32_t calls = c1 - c0;
-    const uint32_t pushes = p1 - p0;
-    const uint64_t busy_us = b1 - b0;
-    const uint64_t worst_us = w1 - w0;    // 本采样窗口内最慢的一帧（累计值是"历史最大"，这里取增量近似）
-    const uint64_t inv_px = px1 - px0;
-    // 每帧平均耗时（含软件渲染 + QSPI 刷屏）；帧率 = 帧数 / 采样秒数
-    const uint32_t avg_us = (frames > 0) ? (uint32_t)(busy_us / frames) : 0;
-    const uint32_t avg_px = (frames > 0) ? (uint32_t)(inv_px / frames) : 0;
-    const uint32_t fps_x10 = (uint32_t)((uint64_t)frames * 10 / (uint32_t)seconds);
-    const uint32_t heap = (uint32_t)esp_get_free_heap_size();
+    PerfSamplerStart();                     // 幂等；后台每 2 秒算一次
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const uint32_t age_ms = (g_perf.at_ms > 0) ? (uint32_t)(now_ms - g_perf.at_ms) : 0xFFFFFFFF;
 
     char body[400];
     snprintf(body, sizeof(body),
-             "sample=%d s\n"
+             "# non-blocking: sampled in the background (2 s window), no socket is held\n"
+             "age=%lu ms\n"
              "frames=%lu  ->  %lu.%lu fps\n"
-             "avg frame busy=%lu us (render+flush)   worst=%lu us\n"
+             "avg frame busy=%lu us (render+flush)\n"
              "avg redraw=%lu px/frame   peak=%lu px\n"
              "ring timer calls=%lu  real redraws=%lu\n"
              "free heap=%lu bytes\n",
-             seconds, (unsigned long)frames, (unsigned long)(fps_x10 / 10),
-             (unsigned long)(fps_x10 % 10), (unsigned long)avg_us, (unsigned long)worst_us,
-             (unsigned long)avg_px, (unsigned long)im1, (unsigned long)calls,
-             (unsigned long)pushes, (unsigned long)heap);
+             (unsigned long)(age_ms == 0xFFFFFFFF ? 0 : age_ms), (unsigned long)g_perf.frames,
+             (unsigned long)(g_perf.fps_x10 / 10), (unsigned long)(g_perf.fps_x10 % 10),
+             (unsigned long)g_perf.avg_us, (unsigned long)g_perf.avg_px,
+             (unsigned long)g_perf.peak_px, (unsigned long)g_perf.calls,
+             (unsigned long)g_perf.pushes, (unsigned long)esp_get_free_heap_size());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
-
 // 台架用：查询/调整「表情图」与「顶部时间」的放大比例（立即生效，不用重刷固件）
 //   http://<设备IP>:8099/size                     查询当前值
 //   http://<设备IP>:8099/size?emoji=150&clock=160  设置并立即生效
 esp_err_t SizeHandler(httpd_req_t* req) {
+    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
+        return DenyWrite(req);
+    }
     char query[64] = {};
     char value[16] = {};
     int emoji = 0;
