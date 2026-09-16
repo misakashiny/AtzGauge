@@ -13,6 +13,7 @@
 #include "atz_arc_text.h"
 #include "atz_rpm_ring.h"
 #include "atz_shot.h"
+#include "atz_trip.h"
 #include "espnow_link.h"
 #include "lvgl_theme.h"
 #include "mcp_server.h"
@@ -263,6 +264,8 @@ void AtzLcdDisplay::SetupUI() {
 #if ATZ_ARC_TEXT_ENABLE && ATZ_ARC_TEXT_HIDE_BAR
     SetStockSubtitleVisible(false);
 #endif
+
+    atz_trip_init(this);   // 行程统计/峰值保持（见 atz_trip.cc）
 
     // 字幕冻结轮询：见 TickSubtitleFreeze() 的说明（省掉空闲时 ~14% CPU）
 #if ATZ_SUBTITLE_FREEZE
@@ -1093,6 +1096,58 @@ void atz_ui_register_tools(AtzLcdDisplay* display) {
             atz_rpm_ring_set_enabled(on);
             atz_rpm_ring_save_enabled(on);      // 写 NVS：重启后仍生效
             return std::string(on ? "rpm ring is now ON" : "rpm ring is now OFF");
+        });
+
+    // ── 换挡提示灯（语音可设阈值）─────────────────────────────────────────
+    mcp_server.AddTool(
+        "self.ui.set_shift_light",
+        "Set the shift-light RPM on the ring around the screen: when engine RPM reaches this value "
+        "the ring flashes green to tell the driver to shift up. Call this when the user says "
+        "\"换挡提示设到 6800\", \"换挡灯 7000 转\", \"set shift light to 6800\", "
+        "\"把换挡提示关掉\" -> rpm=0. Sensible range 2000~8000. It is stored on the device and "
+        "survives a reboot. Returns the value that is now in effect.",
+        PropertyList({Property("rpm", kPropertyTypeInteger, 0, 8000)}),
+        [](const PropertyList& properties) -> ReturnValue {
+            const int rpm = properties["rpm"].value<int>();
+            atz_rpm_ring_set_shift_rpm(rpm);
+            atz_rpm_ring_save_shift_rpm(atz_rpm_ring_shift_rpm());   // 夹紧后再存
+            char msg[96];
+            const int now = atz_rpm_ring_shift_rpm();
+            if (now > 0) {
+                snprintf(msg, sizeof(msg), "shift light is now ON at %d rpm", now);
+            } else {
+                snprintf(msg, sizeof(msg), "shift light is now OFF");
+            }
+            return std::string(msg);
+        });
+
+    // ── 行程统计（峰值保持）：用户问"最高水温多少"就调它 ────────────────
+    mcp_server.AddTool(
+        "self.car.get_trip",
+        "Report the trip statistics / peak values recorded since the last reset: estimated distance, "
+        "maximum RPM, maximum speed, peak coolant / oil / intake temperature, peak engine load, "
+        "minimum battery voltage, and how many seconds were spent above the shift-light RPM. "
+        "Call this when the user asks things like \"最高水温多少\", \"这一趟最高转速\", \"跑了多远\", "
+        "\"peak stats\", \"trip summary\". The numbers come from the car instrument over ESP-NOW; "
+        "if nothing has been received yet the tool says so explicitly.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            char buf[320];
+            atz_trip_describe(buf, sizeof(buf));
+            return std::string(buf);
+        });
+
+    mcp_server.AddTool(
+        "self.car.reset_trip",
+        "Clear the trip statistics (peak values and distance) and start a new trip. Call this when "
+        "the user says \"行程清零\", \"重新开始统计\", \"reset the trip\". "
+        "Ask for confirmation first if the user did not clearly intend to erase it.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            atz_trip_reset();
+            return std::string("trip statistics cleared");
         });
 
     // 顶栏图标（WiFi / 电量）：圆屏顶栏很窄，默认不显示 WiFi 图标。

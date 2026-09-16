@@ -23,6 +23,7 @@
 
 #include "assets/lang_config.h"
 #include "atz_rpm_ring.h"
+#include "atz_trip.h"
 #include "atz_ui_config.h"
 #include "display.h"
 #include "espnow_link.h"
@@ -75,6 +76,7 @@ lv_obj_t* g_grid = nullptr;       // 其余字段（flex row wrap）
 lv_timer_t* g_timer = nullptr;
 lv_obj_t* g_link_label = nullptr;
 lv_obj_t* g_stale_label = nullptr;
+lv_obj_t* g_trip_label = nullptr;   // 行程峰值一行：峰值·转速 / 水温 / 油温
 
 struct FieldUi {
     lv_obj_t* cell = nullptr;        // 整格容器（隐藏它就等于"这一项不显示"）
@@ -445,6 +447,11 @@ void BuildPage(lv_obj_t* screen) {
     PlaceAt(g_stale_label, 0, 152);
     lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
 
+    // ── 行程一行（峰值保持）：圆屏底部 y=+150 处可用宽度约 190px，所以只放最关键的三个数
+    g_trip_label = MakeLabel(g_page, "", ATZ_PAGE_LABEL, nullptr);
+    lv_obj_set_style_text_align(g_trip_label, LV_TEXT_ALIGN_CENTER, 0);
+    PlaceAt(g_trip_label, 0, 150);
+
     lv_obj_add_flag(g_page, LV_OBJ_FLAG_HIDDEN);   // 默认隐藏
     ESP_LOGI(TAG, "car page built");
 }
@@ -526,6 +533,24 @@ void RefreshPage(void) {
             lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_remove_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // ── 行程峰值一行（"当前值"看上面，"最高值"看这里）────────────────────
+    if (g_trip_label != nullptr) {
+        atz_trip_stats_t trip = {};
+        atz_trip_get(&trip);
+        if (trip.samples == 0) {
+            lv_label_set_text(g_trip_label, "");
+            lv_obj_add_flag(g_trip_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            char text[64];
+            snprintf(text, sizeof(text), "峰值 %u rpm / %d C / %d C", (unsigned)trip.max_rpm,
+                     (int)trip.max_coolant, (int)trip.max_oil);
+            if (strcmp(lv_label_get_text(g_trip_label), text) != 0) {
+                lv_label_set_text(g_trip_label, text);
+            }
+            lv_obj_remove_flag(g_trip_label, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }

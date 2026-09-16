@@ -55,6 +55,8 @@ int64_t g_alert_until_us = 0;      // 闪到什么时候
 int64_t g_alert_grace_us = 0;      // 告警解除后的余辉截止
 bool g_alert_on = false;           // 当前这一拍是不是"红"
 car_alarm_id_t g_alert_last_id = CAR_ALARM_NONE;
+int g_shift_rpm = ATZ_SHIFT_DEFAULT_RPM;    // 换挡提示阈值（0 = 关；NVS 持久化）
+bool g_shift_on = false;                    // 当前这一拍换挡灯是否亮
 int g_alert_signalled = -1;        // 上一次已提示的告警 id（-1 = 还没提示过）
 
 // 插值状态（见下面 RingTimerCb 的说明）
@@ -141,14 +143,21 @@ void StyleArc(void) {
     lv_obj_set_style_border_width(g_arc, 0, LV_PART_KNOB);
 }
 
-/** 视觉告警一拍：on = 染成告警红，off = 恢复主题色。 */
-void SetBezelAlert(bool on) {
+/**
+ * 决定外沿细环这一拍该是什么颜色。优先级：**告警红 > 换挡提示 > 主题色**。
+ * 为什么告警优先：两者同时发生时，那是"故障"不是"该换挡了"，不能混淆。
+ */
+void ApplyBezelColor(void) {
     if (g_bezel == nullptr) {
         return;
     }
-    lv_obj_set_style_arc_color(g_bezel,
-                               lv_color_hex(on ? (uint32_t)ATZ_ALERT_COLOR : BezelColor()),
-                               LV_PART_MAIN);
+    uint32_t color = BezelColor();
+    if (g_alert_on) {
+        color = ATZ_ALERT_COLOR;
+    } else if (g_shift_on) {
+        color = ATZ_SHIFT_COLOR;
+    }
+    lv_obj_set_style_arc_color(g_bezel, lv_color_hex(color), LV_PART_MAIN);
     lv_obj_set_style_arc_opa(g_bezel, (lv_opa_t)ATZ_RPM_RING_BEZEL_OPA, LV_PART_MAIN);
 }
 
@@ -212,15 +221,42 @@ void RingTimerCb(lv_timer_t* timer) {
         const bool active = (now_us < g_alert_until_us) || (now_us < g_alert_grace_us);
         if (!active && g_alert_on) {
             g_alert_on = false;
-            SetBezelAlert(false);
             g_alert_signalled = -1;
         } else if (active) {
             const int64_t half_period_us = 1000000 / (ATZ_ALERT_FLASH_HZ * 2);
-            const bool on = ((now_us / half_period_us) % 2) != 0;
-            if (on != g_alert_on) {
-                g_alert_on = on;
-                SetBezelAlert(on);
-            }
+            g_alert_on = ((now_us / half_period_us) % 2) != 0;
+        } else {
+            g_alert_on = false;
+        }
+    }
+
+    // ── 换挡提示灯（shift light）─────────────────────────────────────────
+    // 到阈值就让细环闪 ATZ_SHIFT_COLOR（比告警闪得快）。告警优先，见 ApplyBezelColor()。
+#if ATZ_SHIFT_ENABLE
+    if (g_bezel != nullptr && g_shift_rpm > 0) {
+        const bool above = (g_target_value >= g_shift_rpm);
+        const int64_t now_us2 = esp_timer_get_time();
+        const int64_t half_us = 1000000 / (ATZ_SHIFT_HZ * 2);
+        g_shift_on = above && (((now_us2 / half_us) % 2) != 0);
+    } else {
+        g_shift_on = false;
+    }
+#else
+    g_shift_on = false;
+#endif
+
+    // 颜色统一在这里落地（告警/换挡/正常三选一）
+    if (g_bezel != nullptr) {
+        static uint32_t s_last_color = 0xFFFFFFFF;
+        uint32_t want = BezelColor();
+        if (g_alert_on) {
+            want = ATZ_ALERT_COLOR;
+        } else if (g_shift_on) {
+            want = ATZ_SHIFT_COLOR;
+        }
+        if (want != s_last_color) {
+            s_last_color = want;
+            ApplyBezelColor();
         }
     }
 #endif
@@ -404,6 +440,9 @@ void atz_rpm_ring_init(Display* display) {
 
     // 用户的开关状态（语音改过就写 NVS）：默认 = 编译期 ATZ_RPM_RING_ENABLE
     g_enabled = Settings(ATZ_UI_NVS_NAMESPACE, true).GetInt(ATZ_UI_NVS_KEY_RPM_RING, 1) != 0;
+    // 换挡提示阈值（语音可改，写 NVS）
+    g_shift_rpm = (int)Settings(ATZ_UI_NVS_NAMESPACE, true)
+                      .GetInt(ATZ_UI_NVS_KEY_SHIFT_RPM, ATZ_SHIFT_DEFAULT_RPM);
     atz_rpm_ring_set_enabled(g_enabled);
 
     ESP_LOGI(TAG, "rpm ring ready: d=%d w=%d (outer r=%d = screen edge), full scale=%d rpm "
@@ -451,6 +490,27 @@ void atz_rpm_ring_save_enabled(bool on) {
 
 bool atz_rpm_ring_enabled(void) {
     return g_enabled;
+}
+
+// ── 换挡提示灯（shift light）──────────────────────────────────────────────
+void atz_rpm_ring_set_shift_rpm(int rpm) {
+    if (rpm != 0 && rpm < ATZ_SHIFT_MIN_RPM) {
+        rpm = ATZ_SHIFT_MIN_RPM;      // 防手误：设成 800 会一路闪
+    }
+    if (rpm > ATZ_RPM_RING_MAX_RPM) {
+        rpm = ATZ_RPM_RING_MAX_RPM;
+    }
+    g_shift_rpm = rpm;
+    ESP_LOGI(TAG, "shift light %s (threshold %d rpm)", rpm > 0 ? "ON" : "OFF", rpm);
+}
+
+int atz_rpm_ring_shift_rpm(void) {
+    return g_shift_rpm;
+}
+
+void atz_rpm_ring_save_shift_rpm(int rpm) {
+    Settings(ATZ_UI_NVS_NAMESPACE, true).SetInt(ATZ_UI_NVS_KEY_SHIFT_RPM, rpm);
+    ESP_LOGI(TAG, "shift light threshold saved to NVS: %d", rpm);
 }
 
 void atz_rpm_ring_set_visible(bool visible) {
@@ -546,6 +606,9 @@ bool atz_rpm_ring_visible(void) { return false; }
 void atz_rpm_ring_set_enabled(bool on) { (void)on; }
 bool atz_rpm_ring_enabled(void) { return false; }
 void atz_rpm_ring_save_enabled(bool on) { (void)on; }
+void atz_rpm_ring_set_shift_rpm(int rpm) { (void)rpm; }
+int atz_rpm_ring_shift_rpm(void) { return 0; }
+void atz_rpm_ring_save_shift_rpm(int rpm) { (void)rpm; }
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb) { (void)fg_rgb; }
 void atz_rpm_ring_refresh(void) {}
 void atz_rpm_ring_perf(char* buf, size_t len, uint32_t frames, uint64_t busy_us, uint32_t calls,

@@ -7,6 +7,7 @@
 #include "espnow_link.h"
 #include "atz_car_page.h"
 #include "atz_rpm_ring.h"
+#include "atz_trip.h"
 #include "atz_touch.h"
 #include "atz_ui.h"
 #include "jpg/image_to_jpeg.h"
@@ -40,6 +41,7 @@ esp_err_t LayoutHandler(httpd_req_t* req);
 esp_err_t SubtitleHandler(httpd_req_t* req);
 esp_err_t InjectHandler(httpd_req_t* req);
 esp_err_t RingHandler(httpd_req_t* req);
+esp_err_t TripHandler(httpd_req_t* req);
 
 // ── 调试端点鉴权 ────────────────────────────────────────────────────────────
 // 只给"写操作"加锁：/theme /carbar /carpage /size /inject /ring /subtitle。
@@ -315,7 +317,7 @@ void StartTask(void* arg) {
             // ★ 必须 ≥ 实际注册的端点个数：httpd_register_uri_handler 超限时只返回
             //   ESP_ERR_HTTPD_HANDLERS_FULL，**不会**报错也不会崩，表现为该 URL 直接 404。
             //   （踩过一次：设 4 而注册了 5 个 → /touch 一直 404。）
-            config.max_uri_handlers = 14;
+            config.max_uri_handlers = 16;   // 注意：加端点要同步改这里，否则注册失败只报一条 E 日志
 
             if (httpd_start(&g_server, &config) != ESP_OK) {
                 ESP_LOGE(TAG, "failed to start snapshot server on port %d",
@@ -379,6 +381,12 @@ void StartTask(void* arg) {
                 .handler = LayoutHandler,
                 .user_ctx = nullptr,
             };
+            httpd_uri_t trip_uri = {
+                .uri = "/trip",
+                .method = HTTP_GET,
+                .handler = TripHandler,
+                .user_ctx = nullptr,
+            };
             httpd_uri_t ring_uri = {
                 .uri = "/ring",
                 .method = HTTP_GET,
@@ -415,6 +423,9 @@ void StartTask(void* arg) {
             }
             if (httpd_register_uri_handler(g_server, &layout_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/layout registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &trip_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/trip registration failed (max_uri_handlers too small?)");
             }
             if (httpd_register_uri_handler(g_server, &ring_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/ring registration failed (max_uri_handlers too small?)");
@@ -713,22 +724,61 @@ esp_err_t InjectHandler(httpd_req_t* req) {
 //   http://<设备IP>:8099/ring            查询
 //   http://<设备IP>:8099/ring?enabled=0  关掉（写 NVS，重启仍生效）
 esp_err_t RingHandler(httpd_req_t* req) {
-    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
-        return DenyWrite(req);
-    }
-    char query[48] = {};
+    // 注意：/ring 不带参数时是**只读查询**，不该要 key；只有带 enabled=/shift= 才算写。
+    char query[64] = {};
     char value[16] = {};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "enabled", value, sizeof(value)) == ESP_OK) {
-        const bool on = atoi(value) != 0;
-        atz_rpm_ring_set_enabled(on);
-        atz_rpm_ring_save_enabled(on);          // 写 NVS：重启后仍生效
+    const bool has_query = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
+    const bool want_enabled = has_query && httpd_query_key_value(query, "enabled", value, sizeof(value)) == ESP_OK;
+    const int enabled_val = want_enabled ? atoi(value) : -1;
+    const bool want_shift = has_query && httpd_query_key_value(query, "shift", value, sizeof(value)) == ESP_OK;
+    const int shift_val = want_shift ? atoi(value) : -1;
+
+    if (want_enabled || want_shift) {           // 只有写操作才校验 token
+        if (!WriteAllowed(req)) {
+            return DenyWrite(req);
+        }
+        if (want_enabled) {
+            atz_rpm_ring_set_enabled(enabled_val != 0);
+            atz_rpm_ring_save_enabled(enabled_val != 0);
+        }
+        if (want_shift) {
+            atz_rpm_ring_set_shift_rpm(shift_val);
+            atz_rpm_ring_save_shift_rpm(atz_rpm_ring_shift_rpm());
+        }
     }
-    char body[96];
-    snprintf(body, sizeof(body), "ring enabled=%d visible=%d\n", (int)atz_rpm_ring_enabled(),
-             (int)atz_rpm_ring_visible());
+    char body[128];
+    snprintf(body, sizeof(body), "ring enabled=%d visible=%d shift=%d rpm\n",
+             (int)atz_rpm_ring_enabled(), (int)atz_rpm_ring_visible(),
+             atz_rpm_ring_shift_rpm());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
+// 台架用：行程统计（等价语音 self.car.get_trip / self.car.reset_trip）
+//   http://<设备IP>:8099/trip              查询
+//   http://<设备IP>:8099/trip?reset=1&key=  清零
+esp_err_t TripHandler(httpd_req_t* req) {
+    char query[64] = {};
+    char value[16] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "reset", value, sizeof(value)) == ESP_OK && atoi(value) != 0) {
+        if (!WriteAllowed(req)) {   // 清零是写操作
+            return DenyWrite(req);
+        }
+        atz_trip_reset();
+    }
+    atz_trip_stats_t s = {};
+    atz_trip_get(&s);
+    char body[384];
+    snprintf(body, sizeof(body),
+             "samples=%lu uptime=%lu s\n"
+             "max: rpm=%u speed=%u coolant=%d oil=%d intake=%d load=%d\n"
+             "min batt=%.2f V   distance~%.2f km   above %d rpm: %lu s\n",
+             (unsigned long)s.samples, (unsigned long)s.uptime_s, (unsigned)s.max_rpm,
+             (unsigned)s.max_speed, (int)s.max_coolant, (int)s.max_oil, (int)s.max_intake,
+             (int)s.max_load, s.min_bat_mv / 1000.0, s.km_x100 / 100.0,
+             atz_rpm_ring_shift_rpm(), (unsigned long)s.above_shift_s);
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
 // 台架用：量 UI 的真实流畅度 —— 直接读 LVGL 每帧的渲染事件，而不是"看着挺顺"。
 //   http://<设备IP>:8099/perf?seconds=5
 // 输出：帧率、平均每帧"渲染+刷屏"耗时、环定时器实际调用次数与真正触发重绘的次数。

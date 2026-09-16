@@ -30,6 +30,11 @@ bool atz_rpm_ring_enabled(void);
 /** 把开关写进 NVS（语音工具 / /ring 端点用；set_enabled 本身只改内存与显示）。 */
 void atz_rpm_ring_save_enabled(bool on);
 
+// ── 换挡提示灯（shift light）：到阈值细环闪提示色，0 = 关闭 ────────────────
+void atz_rpm_ring_set_shift_rpm(int rpm);
+int atz_rpm_ring_shift_rpm(void);
+void atz_rpm_ring_save_shift_rpm(int rpm);
+
 /** 跟随主题换色（fg_rgb = 圈与弧的基色，传 0xRRGGBB；底槽用同色低不透明度，深浅主题都好看）。 */
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb);
 

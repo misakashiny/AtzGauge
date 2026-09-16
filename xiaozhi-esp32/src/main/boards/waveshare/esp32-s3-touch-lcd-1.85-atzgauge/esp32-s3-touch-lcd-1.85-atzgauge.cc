@@ -20,6 +20,7 @@
 // 「车况」整屏页面（语音进入）。见 atz_car_page.h。
 #include "atz_car_page.h"
 #include "atz_dim.h"
+#include "lvgl_theme.h"
 #include "settings.h"
 
 #include <esp_log.h>
@@ -514,6 +515,58 @@ private:
             return !gpio_get_level(BOOT_BUTTON_GPIO);
         };
         ESP_ERROR_CHECK(iot_button_create(&boot_btn_config, boot_btn_driver_, &boot_btn));
+        // ── BOOT 键多手势（车上不用说话就能操作）─────────────────────────
+        //   单击：原有逻辑（配网 / 关车况页 / 开始说话）
+        //   双击：静音 ↔ 恢复（用最省事的方式：音量存 0 再恢复）
+        //   长按 2 秒：在可用主题之间循环（light ↔ dark；ATZ_UI_ENABLE=1 时还会带上 atz-*）
+        //   注：注册了双击之后，单击事件会等双击窗口（约 300ms）才派发 —— 触屏才是主入口，
+        //       所以这点延迟可以接受。
+        iot_button_register_cb(boot_btn, BUTTON_DOUBLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<AtzGaugeBoard*>(usr_data);
+            auto codec = self->GetAudioCodec();
+            if (codec == nullptr) {
+                return;
+            }
+            static int saved_volume = 70;
+            if (codec->output_volume() > 0) {
+                saved_volume = codec->output_volume();
+                codec->SetOutputVolume(0);
+                ESP_LOGI(TAG, "boot double-click: muted (was %d)", saved_volume);
+            } else {
+                codec->SetOutputVolume(saved_volume > 0 ? saved_volume : 70);
+                ESP_LOGI(TAG, "boot double-click: unmuted (%d)", saved_volume);
+            }
+        }, this);
+
+        iot_button_register_cb(boot_btn, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<AtzGaugeBoard*>(usr_data);
+            auto* display = self->GetDisplay();
+            if (display == nullptr) {
+                return;
+            }
+            // 在"可用且已注册"的主题间循环：light / dark 永远有；ATZ_UI_ENABLE=1 时再加三套 atz-*
+            static const char* kCycle[] = {"light", "dark", "atz-night", "atz-day", "atz-amber"};
+            auto* cur = display->GetTheme();
+            const char* cur_name = (cur != nullptr) ? cur->name().c_str() : "light";
+            int idx = 0;
+            for (int i = 0; i < (int)(sizeof(kCycle) / sizeof(kCycle[0])); i++) {
+                if (strcmp(kCycle[i], cur_name) == 0) {
+                    idx = i;
+                    break;
+                }
+            }
+            auto& mgr = LvglThemeManager::GetInstance();
+            for (int step = 1; step <= (int)(sizeof(kCycle) / sizeof(kCycle[0])); step++) {
+                const char* want = kCycle[(idx + step) % (sizeof(kCycle) / sizeof(kCycle[0]))];
+                auto* theme = mgr.GetTheme(want);
+                if (theme != nullptr) {           // 未注册的主题（atz-* 在 UI=0 时）自然跳过
+                    display->SetTheme(theme);
+                    ESP_LOGI(TAG, "boot long-press: theme -> %s", want);
+                    return;
+                }
+            }
+        }, this);
+
         iot_button_register_cb(boot_btn, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<AtzGaugeBoard*>(usr_data);
             auto& app = Application::GetInstance();
