@@ -22,7 +22,7 @@
 #include "atz_car_page.h"
 
 #include "assets/lang_config.h"
-#include "atz_rpm_ring.h"
+#include "atz_perf.h"
 #include "atz_trip.h"
 #include "atz_ui_config.h"
 #include "display.h"
@@ -33,6 +33,7 @@
 #include "settings.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <lvgl.h>
@@ -44,7 +45,7 @@
 
 #define TAG "AtzCarPage"
 
-LV_FONT_DECLARE(font_noto_sans_basic_30_4);   // 主数值用（清晰的真 30px 字体）
+LV_FONT_DECLARE(font_noto_sans_basic_30_4);   // 车况页两个主数值用（清晰的真 30px 字体）
 
 // ── 可调参数 ────────────────────────────────────────────────────────────────
 #define ATZ_CAR_PAGE_REFRESH_MS   300     // 刷新周期
@@ -53,6 +54,23 @@ LV_FONT_DECLARE(font_noto_sans_basic_30_4);   // 主数值用（清晰的真 30p
 #define ATZ_CAR_PAGE_CELL_W       142     // 网格单元宽（两列 + 间距正好 ≤ 列宽）
 #define ATZ_CAR_PAGE_GRID_GAP     8       // 网格列间距
 #define ATZ_CAR_PAGE_GRID_ROW_GAP 4       // 网格行间距
+// 「行程」页（page1）
+// ★ 这一页的几何是**量出来的**，不是拍脑袋：360×360 圆屏上，四行双行卡片(62px)要 260px，
+//   而状态行 + 按钮行已经吃掉顶部约 60px，剩下的可用高度只有 ~245px → 第四行必被圆边切掉
+//   （实测：布局里最后一行落在 y=369，已经出屏）。所以最终收敛成：
+//     状态行(y=8, 31px) / 按钮行(y=40, 22px) / 六张卡片 3 行(y=104..264, 每格 142×50)
+#define ATZ_TRIP_PAGE_CELL_W      142     // 卡宽（与车况页同宽）
+#define ATZ_TRIP_PAGE_CELL_H      50      // 卡高 = 项目名 21px + 数值 29px（故意让两行贴紧）
+#define ATZ_TRIP_PAGE_CARDS       6       // 行程页的数据卡数量（受圆屏高度限制，6 张正好）
+// 行程页顶部两行的位置（★ 都用 LV_ALIGN_TOP_MID，理由见 BuildTripPage 里的说明）
+//  y=8  → 状态行（可用宽 ≈213px；"● 记录中 1:23:45" 约 200px）
+//  y=40 → 按钮行（可用宽 ≈242px；两个按钮 120+8+112=240px 正好）
+#define ATZ_TRIP_HDR_Y            0       // 头部容器（状态行 + 按钮行都挂在它下面）
+#define ATZ_TRIP_HDR_H            64      // 头部高度 = 8+31 状态行 + 1 空隙 + 22 按钮 ≈ 62
+#define ATZ_TRIP_TITLE_Y          8       // 状态行（相对头部容器）
+#define ATZ_TRIP_BTN_Y            40      // 按钮行（相对头部容器）
+#define ATZ_TRIP_BTN_H            22      // 按钮高度
+#define ATZ_TRIP_COL_Y            104     // 数据网格（用 TOP_MID 定位，不用 CENTER）
 
 // 配色（参考 obd_brz_gauge 的深色仪表风）
 #define ATZ_PAGE_BG        0x000000
@@ -76,7 +94,49 @@ lv_obj_t* g_grid = nullptr;       // 其余字段（flex row wrap）
 lv_timer_t* g_timer = nullptr;
 lv_obj_t* g_link_label = nullptr;
 lv_obj_t* g_stale_label = nullptr;
-lv_obj_t* g_trip_label = nullptr;   // 行程峰值一行：峰值·转速 / 水温 / 油温
+lv_obj_t* g_hint_label = nullptr;   // 底部一行小字：提示"点一下看行程"
+
+// ── 「行程」页（page1）──────────────────────────────────────────────────────
+int g_page_no = 0;                  // 0 = 车况，1 = 行程
+lv_obj_t* g_trip_hdr = nullptr;     // 行程页头部容器（状态行 + 按钮行；隐藏它一个就够）
+lv_obj_t* g_trip_col = nullptr;     // 行程页数据网格所在列（flex column）
+lv_obj_t* g_trip_title = nullptr;   // 「● 记录中 · 0:12:34」状态行
+lv_obj_t* g_trip_grid = nullptr;    // 数据卡网格（flex row wrap）
+lv_obj_t* g_trip_status = nullptr;  // 操作结果提示（点按钮后回一句）
+lv_obj_t* g_rec_btn = nullptr;
+lv_obj_t* g_rec_btn_label = nullptr;
+lv_obj_t* g_reset_btn = nullptr;
+int64_t g_trip_status_until_us = 0; // 状态提示的显示截止时间
+
+struct TripCard {
+    lv_obj_t* value = nullptr;
+    lv_obj_t* unit = nullptr;
+};
+TripCard g_trip_cards[ATZ_TRIP_PAGE_CARDS];
+
+// ★ 6 张卡（圆屏高度只放得下 3 行 × 2 列）：项目名 2 字 + 数值（含单位）同一行。
+//   宽度核算（20px 字体，一个汉字=20px、一个数字≈11px）：
+//     里程 40 + "0.0km" 51 = 91 ✓   水温 40 + "104C" 51 = 91 ✓
+//     转速 40 + "7100rpm" 94 = 134 ✓  电压 40 + "13.9V" 62 = 102 ✓
+//   数值在 142px 内、不会挤到隔壁列（8 张卡的双行版就是在这里翻车的，见文件开头的记录）。
+struct TripCardDef {
+    const char* name;
+    const char* unit;
+    uint32_t color;
+};
+const TripCardDef kTripCards[ATZ_TRIP_PAGE_CARDS] = {
+    {"里程", "km",   ATZ_PAGE_VALUE},
+    {"转速", "rpm",  ATZ_PAGE_RPM},
+    {"车速", "km/h", ATZ_PAGE_SPEED},
+    {"水温", "C",    ATZ_PAGE_WARN},
+    {"油温", "C",    ATZ_PAGE_WARN},
+    {"电压", "V",    ATZ_PAGE_VALUE},
+};
+
+// 前置声明（两页的构建/刷新/切换互相调用，顺序上谁先谁后都行）
+void RefreshPage(void);
+void RefreshTripPage(void);
+void BuildTripPage(lv_obj_t* parent);
 
 struct FieldUi {
     lv_obj_t* cell = nullptr;        // 整格容器（隐藏它就等于"这一项不显示"）
@@ -447,13 +507,148 @@ void BuildPage(lv_obj_t* screen) {
     PlaceAt(g_stale_label, 0, 152);
     lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
 
-    // ── 行程一行（峰值保持）：圆屏底部 y=+150 处可用宽度约 190px，所以只放最关键的三个数
-    g_trip_label = MakeLabel(g_page, "", ATZ_PAGE_LABEL, nullptr);
-    lv_obj_set_style_text_align(g_trip_label, LV_TEXT_ALIGN_CENTER, 0);
-    PlaceAt(g_trip_label, 0, 150);
+    // ── 底部一行小字：告诉用户"还能翻页"（圆屏 y=+150 处可用宽度约 190px）────
+    g_hint_label = MakeLabel(g_page, "点一下看行程 ▸", ATZ_PAGE_STALE, nullptr);
+    lv_obj_set_style_text_align(g_hint_label, LV_TEXT_ALIGN_CENTER, 0);
+    PlaceAt(g_hint_label, 0, 150);
+
+    BuildTripPage(g_page);   // 「行程」页（page1）：默认隐藏
 
     lv_obj_add_flag(g_page, LV_OBJ_FLAG_HIDDEN);   // 默认隐藏
-    ESP_LOGI(TAG, "car page built");
+    ESP_LOGI(TAG, "car page built (2 pages: car / trip)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 「行程」页（page1）—— 行程统计与峰值保持
+//
+// 布局（360x360 圆屏）：
+//        ● 记录中 · 0:12:34        [ 暂停 ]      y=-150（标题行：状态 + 记录按钮）
+//      ┌────────────────────────────────┐
+//      │  里程 12.4 │ 最高转速 7200      │  8 张数据卡，2 列 × 4 行
+//      │  最高车速 118 │ 最高水温 104    │
+//      │  最高油温 118 │ 最高进气 46     │
+//      │  最高负荷 88% │ 最低电压 13.8   │
+//      └────────────────────────────────┘
+//              [ 清零重来 ]                    y=+150
+// ★ 顶部第一行**必须**能看出"到底在不在记录" —— 这是用户提出这个功能的原话
+//   （"可以通过语音开始记录、重置记录"）：不在记录时是灰的"已暂停"，在记录时是绿的"记录中"。
+// ═══════════════════════════════════════════════════════════════════════════
+
+void TipShow(const char* text) {
+    if (g_trip_status == nullptr) {
+        return;
+    }
+    lv_label_set_text(g_trip_status, text);
+    g_trip_status_until_us = esp_timer_get_time() + 3000000;   // 显示 3 秒
+}
+
+void RecBtnCb(lv_event_t* e) {
+    (void)e;
+    const bool now = !atz_trip_recording();
+    atz_trip_set_recording(now);
+    TipShow(now ? "已开始记录" : "已暂停记录");
+    RefreshTripPage();   // 立刻更新状态行，不等 300ms 定时器
+}
+
+void ResetBtnCb(lv_event_t* e) {
+    (void)e;
+    atz_trip_reset();
+    TipShow("已清零，重新记录");
+    RefreshTripPage();
+}
+
+void RefreshTripPage(void) {
+    if (g_trip_col == nullptr) {
+        return;
+    }
+    atz_trip_stats_t t = {};
+    atz_trip_get(&t);
+    const bool rec = atz_trip_recording();
+
+    // ── 状态行：记录中 / 已暂停 + 已记录时长 ───────────────────────────────
+    //    ★ 时长必须是"从按下开始记录起累计"的秒数（atz_trip 里累加），不是开机秒数。
+    //    ★ 圆屏 y=-152 处只有约 193px ≈ 9 个 20px 汉字，所以文字要短：
+    //      "● 记录中 1:23:45" = 11 字符宽（英文/数字更窄）刚好放得下。
+    if (g_trip_title != nullptr) {
+        char text[40];
+        const uint32_t sec = t.uptime_s;
+        snprintf(text, sizeof(text), "%s %lu:%02lu:%02lu", rec ? "● 记录中" : "● 已暂停",
+                 (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60),
+                 (unsigned long)(sec % 60));
+        if (strcmp(lv_label_get_text(g_trip_title), text) != 0) {
+            lv_label_set_text(g_trip_title, text);
+            atz_perf_count_push();
+        }
+        lv_obj_set_style_text_color(g_trip_title, lv_color_hex(rec ? ATZ_PAGE_OK : ATZ_PAGE_STALE), 0);
+    }
+    if (g_rec_btn_label != nullptr) {
+        const char* want = rec ? "暂停记录" : "开始记录";
+        if (strcmp(lv_label_get_text(g_rec_btn_label), want) != 0) {
+            lv_label_set_text(g_rec_btn_label, want);
+        }
+    }
+
+    // ── 6 张数据卡 ─────────────────────────────────────────────────────────
+    //  单位写法尽量短（"104C" 而不是 "104 C"），142px 的格子里才放得下名字 + 数值。
+    char v[ATZ_TRIP_PAGE_CARDS][20];
+    if (t.samples == 0) {
+        // 没有任何有效样本：全部显示 --（不要显示 0，那会被误当成"真跑过"）
+        for (int i = 0; i < ATZ_TRIP_PAGE_CARDS; i++) {
+            snprintf(v[i], sizeof(v[i]), "--");
+        }
+    } else {
+        snprintf(v[0], sizeof(v[0]), "%.1f%s", t.km_x100 / 100.0, kTripCards[0].unit);
+        snprintf(v[1], sizeof(v[1]), "%u%s", (unsigned)t.max_rpm, kTripCards[1].unit);
+        snprintf(v[2], sizeof(v[2]), "%u%s", (unsigned)t.max_speed, kTripCards[2].unit);
+        snprintf(v[3], sizeof(v[3]), "%d%s", (int)t.max_coolant, kTripCards[3].unit);
+        snprintf(v[4], sizeof(v[4]), "%d%s", (int)t.max_oil, kTripCards[4].unit);
+        // 电压：min_bat_mv 是**毫伏**，必须除 1000（第一版直接印 13900.00 V，一眼假）
+        snprintf(v[5], sizeof(v[5]), "%d.%d%s", (int)(t.min_bat_mv / 1000),
+                 (int)((t.min_bat_mv % 1000) / 100), kTripCards[5].unit);
+    }
+    for (int i = 0; i < ATZ_TRIP_PAGE_CARDS; i++) {
+        if (g_trip_cards[i].value == nullptr) {
+            continue;
+        }
+        if (strcmp(lv_label_get_text(g_trip_cards[i].value), v[i]) != 0) {
+            lv_label_set_text(g_trip_cards[i].value, v[i]);
+            atz_perf_count_push();
+        }
+    }
+
+    // ── 操作提示 3 秒后自动消失 ────────────────────────────────────────────
+    if (g_trip_status != nullptr) {
+        const bool show = (g_trip_status_until_us != 0) && (esp_timer_get_time() < g_trip_status_until_us);
+        if (show) {
+            lv_obj_remove_flag(g_trip_status, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(g_trip_status, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void ApplyPageVisibility(void) {
+    if (g_page == nullptr) {
+        return;
+    }
+    if (g_page_no == 1) {
+        if (g_col != nullptr) lv_obj_add_flag(g_col, LV_OBJ_FLAG_HIDDEN);
+        if (g_stale_label != nullptr) lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
+        if (g_hint_label != nullptr) lv_obj_add_flag(g_hint_label, LV_OBJ_FLAG_HIDDEN);
+        if (g_trip_col != nullptr) lv_obj_remove_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);
+        if (g_trip_hdr != nullptr) lv_obj_remove_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
+        RefreshTripPage();
+        if (g_link_label != nullptr) {
+            lv_label_set_text(g_link_label, "● 行程");
+            lv_obj_set_style_text_color(g_link_label, lv_color_hex(ATZ_PAGE_LABEL), 0);
+        }
+    } else {
+        if (g_trip_col != nullptr) lv_obj_add_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);
+        if (g_trip_hdr != nullptr) lv_obj_add_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
+        if (g_col != nullptr) lv_obj_remove_flag(g_col, LV_OBJ_FLAG_HIDDEN);
+        if (g_hint_label != nullptr) lv_obj_remove_flag(g_hint_label, LV_OBJ_FLAG_HIDDEN);
+        RefreshPage();   // 顶部链接状态与数值由它填
+    }
 }
 
 // 把"哪些字段可见"落到控件上。LVGL 的 flex 会自动跳过 hidden 的子控件，
@@ -474,6 +669,105 @@ void ApplyFieldVisibility(void) {
     }
 }
 
+// 行程页的数据卡（定义见文件开头的 kTripCards）。
+// 卡片自己不做点击（点击交给整页：点一下翻回车况页），只有两个按钮是可点的。
+/** 扁平的胶囊按钮：深底 + 细描边（圆屏上比默认主题按钮清爽，也不受主题色影响）。 */
+void MakePill(lv_obj_t* btn, uint32_t border_rgb, int w, int h) {
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_radius(btn, h / 2, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1F262E), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(border_rgb), 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+}
+
+void BuildTripPage(lv_obj_t* parent) {
+    g_trip_col = MakeBox(parent);
+    lv_obj_set_width(g_trip_col, ATZ_CAR_PAGE_COL_W);
+    lv_obj_set_height(g_trip_col, LV_SIZE_CONTENT);
+    // ★ 这里也改用 TOP_MID：LV_ALIGN_CENTER 依赖对象高度，而高度此刻还是
+    //   LV_SIZE_CONTENT(0)，实测会被放到屏幕正中并与按钮行叠在一起。
+    lv_obj_align(g_trip_col, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_COL_Y);
+    lv_obj_set_flex_flow(g_trip_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_trip_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(g_trip_col, ATZ_CAR_PAGE_GRID_ROW_GAP, 0);
+
+    // ── 数据卡网格 ────────────────────────────────────────────────────────
+    g_trip_grid = MakeBox(g_trip_col);
+    lv_obj_set_width(g_trip_grid, ATZ_CAR_PAGE_COL_W);
+    lv_obj_set_height(g_trip_grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(g_trip_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(g_trip_grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(g_trip_grid, ATZ_CAR_PAGE_GRID_GAP, 0);
+    lv_obj_set_style_pad_row(g_trip_grid, ATZ_CAR_PAGE_GRID_ROW_GAP, 0);
+
+    for (int i = 0; i < ATZ_TRIP_PAGE_CARDS; i++) {
+        lv_obj_t* card = MakeBox(g_trip_grid);
+        lv_obj_set_size(card, ATZ_TRIP_PAGE_CELL_W, ATZ_TRIP_PAGE_CELL_H);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(card, 4, 0);
+
+        MakeLabel(card, kTripCards[i].name, ATZ_PAGE_LABEL, nullptr);
+        g_trip_cards[i].value = MakeLabel(card, "--", kTripCards[i].color, nullptr);
+        g_trip_cards[i].unit = nullptr;   // 单位并进数值文本
+    }
+
+    // ── 操作提示（点按钮后回一句；默认隐藏）────────────────────────────────
+    g_trip_status = MakeLabel(g_trip_col, "", ATZ_PAGE_OK, nullptr);
+    lv_obj_set_style_text_align(g_trip_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(g_trip_status, LV_OBJ_FLAG_HIDDEN);
+
+    // ── 顶部状态行：**必须一眼看出"到底在不在记录"**（用户提这个功能的核心诉求）
+    //    圆屏约束：状态行 y=8 处可用宽度 ≈213px、按钮行 y=40 处 ≈242px。
+    //    ★ 三个坑（都实测踩过，别再改回去）：
+    //      ① 状态文字和按钮塞进同一行（196px 宽）→ 直接叠在一起看不清；
+    //      ② 用 PlaceAt()（= LV_ALIGN_CENTER）定位这两行 → **实测错位 100+ px**：
+    //         LV_ALIGN_CENTER 按对象"当前高度"算，而这些对象的高度此刻还是
+    //         LV_SIZE_CONTENT(0)，算出来就跑到屏幕中间去了。必须用 TOP_MID + y 偏移。
+    //      ③ 状态行/按钮行如果直接挂在整页上，翻回车况页时没人负责把它们藏起来 ——
+    //         实测"两个页面叠在一起"。所以统一塞进一个**头部容器**，隐藏它一个就够。
+    g_trip_hdr = MakeBox(parent);
+    lv_obj_set_size(g_trip_hdr, LV_HOR_RES, ATZ_TRIP_HDR_H);
+    lv_obj_align(g_trip_hdr, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_HDR_Y);
+
+    g_trip_title = MakeLabel(g_trip_hdr, "● 已暂停", ATZ_PAGE_STALE, nullptr);
+    lv_obj_set_style_text_align(g_trip_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(g_trip_title, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_TITLE_Y);
+
+    // ── 按钮行：记录开关 + 清零 ────────────────────────────────────────────
+    lv_obj_t* btn_row = MakeBox(g_trip_hdr);
+    lv_obj_set_width(btn_row, 240);
+    lv_obj_set_height(btn_row, ATZ_TRIP_BTN_H);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_align(btn_row, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_BTN_Y);
+    // 记录按钮：**做成真按钮**。用户要求"可以通过语音开始记录"，但开车时伸手点一下
+    // 比喊一句更快，所以语音与触摸两个入口都给。
+    g_rec_btn = lv_button_create(btn_row);
+    MakePill(g_rec_btn, ATZ_PAGE_OK, 120, ATZ_TRIP_BTN_H);
+    g_rec_btn_label = MakeLabel(g_rec_btn, "开始记录", ATZ_PAGE_OK, nullptr);
+    lv_obj_center(g_rec_btn_label);
+    lv_obj_add_event_cb(g_rec_btn, RecBtnCb, LV_EVENT_CLICKED, nullptr);
+
+    // 清零按钮：与记录按钮并排（不再是页面底部那个孤零零的小按钮）
+    g_reset_btn = lv_button_create(btn_row);
+    MakePill(g_reset_btn, ATZ_PAGE_LABEL, 112, ATZ_TRIP_BTN_H);
+    lv_obj_t* reset_label = MakeLabel(g_reset_btn, "清零重来", ATZ_PAGE_LABEL, nullptr);
+    lv_obj_center(reset_label);
+    lv_obj_add_event_cb(g_reset_btn, ResetBtnCb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_add_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);   // 默认显示的是车况页
+    lv_obj_add_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
+}
+
 void RefreshPage(void) {
     if (g_page == nullptr) {
         return;
@@ -483,7 +777,9 @@ void RefreshPage(void) {
                        espnow_slave_last_rx_age_ms() <= ATZ_CAR_PAGE_STALE_MS;
 
     // 顶部链路状态（★ 圆屏：文字要短，y=-150 处可用宽度约 198px）
-    if (g_link_label != nullptr) {
+    //   ★ 注意：行程页(page1) 时顶部那行归 ApplyPageVisibility() 管，这里**必须让开**，
+    //     否则每 300ms 就被改回"车况 10Hz"，把"● 行程"覆盖掉（实测就是这个问题）。
+    if (g_link_label != nullptr && g_page_no == 0) {
         if (fresh) {
             lv_label_set_text(g_link_label, "● 车况 10Hz");
             lv_obj_set_style_text_color(g_link_label, lv_color_hex(ATZ_PAGE_OK), 0);
@@ -525,6 +821,7 @@ void RefreshPage(void) {
         }
         if (strcmp(lv_label_get_text(g_fields[i].value), text) != 0) {
             lv_label_set_text(g_fields[i].value, text);   // 只在变化时改，减少重绘
+            atz_perf_count_push();                        // 供 /perf 观察"这一页到底改了多少次"
         }
     }
 
@@ -536,29 +833,19 @@ void RefreshPage(void) {
         }
     }
 
-    // ── 行程峰值一行（"当前值"看上面，"最高值"看这里）────────────────────
-    if (g_trip_label != nullptr) {
-        atz_trip_stats_t trip = {};
-        atz_trip_get(&trip);
-        if (trip.samples == 0) {
-            lv_label_set_text(g_trip_label, "");
-            lv_obj_add_flag(g_trip_label, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            char text[64];
-            snprintf(text, sizeof(text), "峰值 %u rpm / %d C / %d C", (unsigned)trip.max_rpm,
-                     (int)trip.max_coolant, (int)trip.max_oil);
-            if (strcmp(lv_label_get_text(g_trip_label), text) != 0) {
-                lv_label_set_text(g_trip_label, text);
-            }
-            lv_obj_remove_flag(g_trip_label, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    // 注：行程/峰值原来挤在这里的一行小字里（"峰值 … rpm / … C / … C"），
+    // 2026-09-16 按用户要求搬到「行程」页（page1）单独显示 8 项，这里只剩翻页提示。
 }
 
 void PageTimerCb(lv_timer_t* timer) {
     // 跑在 LVGL 任务里，锁由 lvgl_port 持有，这里不能再取锁
     (void)timer;
-    if (g_page != nullptr && !lv_obj_has_flag(g_page, LV_OBJ_FLAG_HIDDEN)) {
+    if (g_page == nullptr || lv_obj_has_flag(g_page, LV_OBJ_FLAG_HIDDEN)) {
+        return;   // 页面没显示：一次控件都不碰（省电，也避免无意义重绘）
+    }
+    if (g_page_no == 1) {
+        RefreshTripPage();
+    } else {
         RefreshPage();
     }
 }
@@ -733,7 +1020,35 @@ void atz_car_page_init(Display* display) {
             return atz_car_page_set_fields(fields);
         });
 
-    ESP_LOGI(TAG, "car page ready (voice: show/hide page, set_car_page_field(s)); visible: %s",
+    mcp_server.AddTool(
+        "self.ui.show_trip_page",
+        "Show the full-screen TRIP page (the second page of the car dashboard). It shows the trip "
+        "statistics / peak-hold values recorded so far: estimated distance, maximum RPM, maximum "
+        "speed, peak coolant / oil / intake temperature, peak engine load, minimum battery voltage, "
+        "and how long the recording has been running, plus whether recording is ON or PAUSED.\n"
+        "Call this when the user asks to SEE them, e.g. \"看行程统计\", \"打开行程页\", "
+        "\"看一下峰值\", \"show trip page\", \"trip statistics\". "
+        "Recording itself is controlled with `self.car.set_trip_recording`.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            atz_car_page_set_page(1);
+            return true;
+        });
+
+    mcp_server.AddTool(
+        "self.ui.set_car_page_page",
+        "Switch the car dashboard between its two pages without closing it: "
+        "page=0 -> live values (RPM, speed, temperatures...), page=1 -> trip statistics / peaks. "
+        "Same as the user tapping the screen once.",
+        PropertyList({Property("page", kPropertyTypeInteger, 0, 1)}),
+        [](const PropertyList& properties) -> ReturnValue {
+            atz_car_page_set_page(properties["page"].value<int>());
+            return true;
+        });
+
+    ESP_LOGI(TAG, "car page ready (voice: show/hide page, set_car_page_field(s), show_trip_page); "
+                  "visible: %s",
              JoinVisible().c_str());
 }
 
@@ -742,11 +1057,11 @@ void atz_car_page_show(void) {
         return;
     }
     DisplayLockGuard lock(g_display);
-    RefreshPage();                                  // 先填一次，避免闪一下 -- 
+    g_page_no = 0;                                   // 语音「显示车况」永远先给实时页
+    ApplyPageVisibility();
     lv_obj_remove_flag(g_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_page);
-    atz_rpm_ring_set_visible(false);                 // 转速圈让位，别压在页面上
-    ESP_LOGI(TAG, "car page shown");
+    ESP_LOGI(TAG, "car page shown (page %d)", g_page_no);
 }
 
 void atz_car_page_hide(void) {
@@ -755,7 +1070,6 @@ void atz_car_page_hide(void) {
     }
     DisplayLockGuard lock(g_display);
     lv_obj_add_flag(g_page, LV_OBJ_FLAG_HIDDEN);
-    atz_rpm_ring_set_visible(true);
     ESP_LOGI(TAG, "car page hidden");
 }
 
@@ -773,4 +1087,24 @@ bool atz_car_page_visible(void) {
     }
     DisplayLockGuard lock(g_display);
     return !lv_obj_has_flag(g_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+void atz_car_page_set_page(int page) {
+    if (g_display == nullptr || g_page == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(g_display);
+    g_page_no = (page == 1) ? 1 : 0;
+    ApplyPageVisibility();
+    lv_obj_remove_flag(g_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(g_page);
+    ESP_LOGI(TAG, "car page -> page %d (%s)", g_page_no, g_page_no == 1 ? "trip" : "car");
+}
+
+int atz_car_page_page(void) {
+    return g_page_no;
+}
+
+void atz_car_page_flip(void) {
+    atz_car_page_set_page(g_page_no == 0 ? 1 : 0);
 }

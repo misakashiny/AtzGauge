@@ -1019,12 +1019,19 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
             if (!latched && ++down_samples >= TP_CONFIRM_SAMPLES) {
                 latched = true;
                 atz_dim_kick();   // 有人碰屏幕 = 有交互 → 立刻恢复全亮
-                DeviceState state = app.GetDeviceState();
-                if (state == kDeviceStateIdle) {
-                    ESP_LOGI(TAG, "touch tap -> start conversation");
-                    app.ToggleChatState();
+                if (atz_car_page_visible()) {
+                    // 车况/行程整屏页开着时，点屏 = 翻页（实时数值 ↔ 行程统计），
+                    // 而不是打断当前对话。否则用户想翻个页就把小智喊起来了 —— 很烦。
+                    atz_car_page_flip();
+                    ESP_LOGI(TAG, "touch tap -> car page flipped");
                 } else {
-                    ESP_LOGD(TAG, "touch tap ignored in state %d", (int)state);
+                    DeviceState state = app.GetDeviceState();
+                    if (state == kDeviceStateIdle) {
+                        ESP_LOGI(TAG, "touch tap -> start conversation");
+                        app.ToggleChatState();
+                    } else {
+                        ESP_LOGD(TAG, "touch tap ignored in state %d", (int)state);
+                    }
                 }
             }
         } else {

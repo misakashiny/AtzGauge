@@ -30,10 +30,9 @@ bool atz_rpm_ring_enabled(void);
 /** 把开关写进 NVS（语音工具 / /ring 端点用；set_enabled 本身只改内存与显示）。 */
 void atz_rpm_ring_save_enabled(bool on);
 
-// ── 换挡提示灯（shift light）：到阈值细环闪提示色，0 = 关闭 ────────────────
-void atz_rpm_ring_set_shift_rpm(int rpm);
-int atz_rpm_ring_shift_rpm(void);
-void atz_rpm_ring_save_shift_rpm(int rpm);
+// ── 换挡提示灯：已整块删除（2026-09-16，用户要求）──────────────────────────
+// 车上本来就有换挡灯，屏幕上再闪一个既分心又和"告警红"抢同一条细环。
+// 原来的 set/save_shift_rpm 与 NVS 键 shift_rpm 都不复存在。
 
 /** 跟随主题换色（fg_rgb = 圈与弧的基色，传 0xRRGGBB；底槽用同色低不透明度，深浅主题都好看）。 */
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb);
@@ -41,11 +40,6 @@ void atz_rpm_ring_apply_theme(uint32_t fg_rgb);
 /** 立刻按当前车况刷一帧（测试/刚切回主界面时用，不必等定时器）。 */
 void atz_rpm_ring_refresh(void);
 
-// ── 性能统计（给 /perf 端点用；统计的是 LVGL 的**真实帧率与渲染耗时**）────────
-// frames = 完成的渲染帧数；busy_us = 渲染累计耗时；calls = 环定时器调用次数；
-// pushes = 其中真正改了控件（= 触发重绘）的次数。
-void atz_rpm_ring_perf_read(uint32_t* frames, uint64_t* busy_us, uint32_t* calls, uint32_t* pushes);
-// 扩展统计：worst_us = 最慢一帧；inv_px = 累计重绘像素；inv_max = 单帧最多重绘像素
-void atz_rpm_ring_perf_ext(uint64_t* worst_us, uint64_t* inv_px, uint32_t* inv_max);
-void atz_rpm_ring_perf(char* buf, size_t len, uint32_t frames, uint64_t busy_us, uint32_t calls,
-                       uint32_t pushes);
+// ── 环自己的计数（帧率/耗时/重绘像素统计在 atz_perf.h）──────────────────────
+// calls = 环定时器调用次数；pushes = 其中真正改了控件（= 触发重绘）的次数。
+void atz_rpm_ring_perf_read(uint32_t* calls, uint32_t* pushes);

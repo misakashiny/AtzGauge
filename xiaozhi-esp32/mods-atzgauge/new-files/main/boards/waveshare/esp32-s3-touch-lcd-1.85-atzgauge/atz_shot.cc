@@ -6,6 +6,7 @@
 #include "display.h"
 #include "espnow_link.h"
 #include "atz_car_page.h"
+#include "atz_perf.h"
 #include "atz_rpm_ring.h"
 #include "atz_trip.h"
 #include "atz_touch.h"
@@ -81,8 +82,9 @@ struct PerfSample {
     uint32_t avg_us;
     uint32_t avg_px;
     uint32_t peak_px;
-    uint32_t calls;
-    uint32_t pushes;
+    uint32_t calls;        // 转速环定时器调用次数（环关掉时为 0）
+    uint32_t pushes;       // 转速环真正改控件的次数
+    uint32_t ui_pushes;    // 其它 UI 模块上报的改控件次数（atz_perf_count_push）
     uint32_t frames;
     int64_t at_ms;
 };
@@ -93,17 +95,19 @@ void PerfSamplerTask(void* arg) {
     (void)arg;
     const int window_ms = 2000;
     for (;;) {
-        uint32_t f0 = 0, c0 = 0, p0 = 0, im0 = 0;
+        uint32_t f0 = 0, c0 = 0, p0 = 0, im0 = 0, pc0 = 0;
         uint64_t b0 = 0, px0 = 0, w0 = 0;
-        atz_rpm_ring_perf_read(&f0, &b0, &c0, &p0);
-        atz_rpm_ring_perf_ext(&w0, &px0, &im0);
+        atz_perf_read(&f0, &b0, &pc0);            // 显示层：帧数 / 渲染耗时（atz_perf.cc）
+        atz_perf_ext(&w0, &px0, &im0);            // 显示层：最慢帧 / 重绘像素
+        atz_rpm_ring_perf_read(&c0, &p0);         // 转速环自己的计数（环关掉时为 0）
 
         vTaskDelay(pdMS_TO_TICKS(window_ms));
 
-        uint32_t f1 = 0, c1 = 0, p1 = 0, im1 = 0;
+        uint32_t f1 = 0, c1 = 0, p1 = 0, im1 = 0, pc1 = 0;
         uint64_t b1 = 0, px1 = 0, w1 = 0;
-        atz_rpm_ring_perf_read(&f1, &b1, &c1, &p1);
-        atz_rpm_ring_perf_ext(&w1, &px1, &im1);
+        atz_perf_read(&f1, &b1, &pc1);
+        atz_perf_ext(&w1, &px1, &im1);
+        atz_rpm_ring_perf_read(&c1, &p1);
         const uint32_t frames = f1 - f0;
         const uint64_t busy = b1 - b0;
         const uint64_t px = px1 - px0;
@@ -115,6 +119,7 @@ void PerfSamplerTask(void* arg) {
         g_perf.peak_px = im1;
         g_perf.calls = c1 - c0;
         g_perf.pushes = p1 - p0;
+        g_perf.ui_pushes = pc1 - pc0;
         g_perf.at_ms = esp_timer_get_time() / 1000;
     }
 }
@@ -501,29 +506,52 @@ esp_err_t TouchHandler(httpd_req_t* req) {
 
 // 台架用：显示/隐藏「车况」整屏页面（等价于语音工具 self.ui.show_car_page）
 //   http://<设备IP>:8099/carpage?action=show | hide | toggle
+//   http://<设备IP>:8099/carpage?page=1&key=…        翻到第 2 页（行程统计）
 //   http://<设备IP>:8099/carpage?fields=rpm,coolant   只显示这几项（all = 全部）
 //   http://<设备IP>:8099/carpage?on=intake&off=load   单项开关（等价于语音 set_car_page_field）
+// ★ 不带任何参数的 GET 是**只读查询**（返回当前页/可见字段），不要求 token —— 与其他
+//   只读端点（/health /perf /layout）保持一致；以前这里无条件要 key，探活时很别扭。
 esp_err_t CarPageHandler(httpd_req_t* req) {
-    if (!WriteAllowed(req)) {   // 写操作需要 &key=<ATZ_DEBUG_TOKEN>
-        return DenyWrite(req);
-    }
     char query[192] = {};
     char value[128] = {};
-    const char* action = "show";
     const bool has_query = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
+    const char* action = "show";
     if (has_query && httpd_query_key_value(query, "action", value, sizeof(value)) == ESP_OK) {
         action = value;
     }
+    char page_val[16] = {};
+    const bool want_page = has_query &&
+                           httpd_query_key_value(query, "page", page_val, sizeof(page_val)) == ESP_OK;
+    bool want_on = false, want_off = false, want_fields = false;
+    if (has_query) {
+        want_on = httpd_query_key_value(query, "on", value, sizeof(value)) == ESP_OK;
+        want_off = httpd_query_key_value(query, "off", value, sizeof(value)) == ESP_OK;
+        want_fields = httpd_query_key_value(query, "fields", value, sizeof(value)) == ESP_OK;
+    }
+    const bool is_write = (strcmp(action, "hide") == 0) || (strcmp(action, "toggle") == 0) ||
+                          want_page || want_on || want_off || want_fields;
+    if (is_write && !WriteAllowed(req)) {
+        return DenyWrite(req);
+    }
+
     if (strcmp(action, "hide") == 0) {
         atz_car_page_hide();
     } else if (strcmp(action, "toggle") == 0) {
         atz_car_page_toggle();
-    } else {
+    } else if (is_write) {
         atz_car_page_show();
+    }
+    if (want_page) {
+        atz_car_page_set_page(atoi(page_val));
     }
 
     char body[320];
-    int written = snprintf(body, sizeof(body), "ok: car page -> %s", action);
+    int written = snprintf(body, sizeof(body), "car page visible=%d page=%d (%s)",
+                           (int)atz_car_page_visible(), atz_car_page_page(),
+                           atz_car_page_page() == 1 ? "trip" : "car");
+    if (strcmp(action, "hide") == 0 || strcmp(action, "toggle") == 0) {
+        written += snprintf(body + written, sizeof(body) - written, " [action=%s]", action);
+    }
 
     // 字段开关（可选）：先 on/off（单项），再 fields（整组）
     if (has_query) {
@@ -547,12 +575,17 @@ esp_err_t CarPageHandler(httpd_req_t* req) {
 //   http://<设备IP>:8099/layout
 // 输出每行：缩进 + 控件类型 + 坐标(x1,y1)-(x2,y2) + 宽x高 + 隐藏标记 + 文本（label）
 // 为什么要它：这个板子看不到屏幕、也点不动，所有"距离/尺寸/排列"只能靠真值说话。
+// ★ 2026-09-16：缓冲从 4096 加到 8192 —— 车况页 + 行程页两部分加起来已经超过 4KB，
+//   超出部分被静默截断（"看不到按钮"就是这么来的，白查了半天）。截断时现在会明说。
 esp_err_t LayoutHandler(httpd_req_t* req) {
-    static char buf[4096];
+    static char buf[8192];
     size_t used = 0;
     used += (size_t)snprintf(buf + used, sizeof(buf) - used, "# LVGL tree (screen %dx%d)\n",
                              (int)LV_HOR_RES, (int)LV_VER_RES);
     DumpObjTree(lv_screen_active(), 0, buf, sizeof(buf), &used);
+    if (used + 32 < sizeof(buf)) {
+        snprintf(buf + used, sizeof(buf) - used, "# end of tree\n");
+    }
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -687,6 +720,18 @@ esp_err_t InjectHandler(httpd_req_t* req) {
     // 电压用"伏"传进来（14.2），内部按 mV 存
     if (has && httpd_query_key_value(query, "volt", value, sizeof(value)) == ESP_OK) {
         s_bat_mv = (int32_t)(atof(value) * 1000.0f + 0.5f);
+        // ★ 防手误（2026-09-16 自己踩的）：有人写成 volt=13900（其实是 mV），
+        //   界面就会显示 "13900.00 V" —— 看起来像格式化 bug，其实是输入错了。
+        //   12V 车用铅酸/锂电的合理区间是 8~16V，超出就判为"传的是 mV"并自动换算。
+        if (s_bat_mv > 16000) {
+            ESP_LOGW(TAG, "inject volt=%s looks like mV (%.0f) -> using %.2f V", value,
+                     (double)s_bat_mv, (double)(s_bat_mv / 1000));
+            s_bat_mv = (int32_t)(s_bat_mv / 1000);
+        } else if (s_bat_mv < 8000) {
+            ESP_LOGW(TAG, "inject volt=%s out of range, keeping previous %d mV", value,
+                     (int)s_bat_mv);
+            s_bat_mv = g_inj_bat_mv;
+        }
     }
 
     // ★ 关键：**不在 HTTP 回调里注入一次就完事**，而是交给一个 10Hz 的重复任务。
@@ -720,70 +765,61 @@ esp_err_t InjectHandler(httpd_req_t* req) {
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 
-// 台架用：转速环开关（等价于语音 self.ui.set_rpm_ring）
-//   http://<设备IP>:8099/ring            查询
-//   http://<设备IP>:8099/ring?enabled=0  关掉（写 NVS，重启仍生效）
+// 台架用：转速环状态。★ 环已按用户要求删除（ATZ_RPM_RING_ENABLE=0），
+// 这个端点保留成**只读**，方便台架确认"现在跑的固件里环到底是编进去了没有"。
+//   http://<设备IP>:8099/ring
 esp_err_t RingHandler(httpd_req_t* req) {
-    // 注意：/ring 不带参数时是**只读查询**，不该要 key；只有带 enabled=/shift= 才算写。
-    char query[64] = {};
-    char value[16] = {};
-    const bool has_query = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
-    const bool want_enabled = has_query && httpd_query_key_value(query, "enabled", value, sizeof(value)) == ESP_OK;
-    const int enabled_val = want_enabled ? atoi(value) : -1;
-    const bool want_shift = has_query && httpd_query_key_value(query, "shift", value, sizeof(value)) == ESP_OK;
-    const int shift_val = want_shift ? atoi(value) : -1;
-
-    if (want_enabled || want_shift) {           // 只有写操作才校验 token
-        if (!WriteAllowed(req)) {
-            return DenyWrite(req);
-        }
-        if (want_enabled) {
-            atz_rpm_ring_set_enabled(enabled_val != 0);
-            atz_rpm_ring_save_enabled(enabled_val != 0);
-        }
-        if (want_shift) {
-            atz_rpm_ring_set_shift_rpm(shift_val);
-            atz_rpm_ring_save_shift_rpm(atz_rpm_ring_shift_rpm());
-        }
-    }
-    char body[128];
-    snprintf(body, sizeof(body), "ring enabled=%d visible=%d shift=%d rpm\n",
-             (int)atz_rpm_ring_enabled(), (int)atz_rpm_ring_visible(),
-             atz_rpm_ring_shift_rpm());
+    char body[160];
+    snprintf(body, sizeof(body),
+             "ring compiled_in=%d (ATZ_RPM_RING_ENABLE=0 means the feature is removed)\n"
+             "ring enabled=%d visible=%d\n",
+             (int)ATZ_RPM_RING_ENABLE, (int)atz_rpm_ring_enabled(), (int)atz_rpm_ring_visible());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
-// 台架用：行程统计（等价语音 self.car.get_trip / self.car.reset_trip）
-//   http://<设备IP>:8099/trip              查询
-//   http://<设备IP>:8099/trip?reset=1&key=  清零
+// 台架用：行程统计（等价语音 self.car.get_trip / self.car.reset_trip / self.car.set_trip_recording）
+//   http://<设备IP>:8099/trip                查询
+//   http://<设备IP>:8099/trip?reset=1&key=…  清零并开始新一趟
+//   http://<设备IP>:8099/trip?rec=1&key=…    开始记录    rec=0 暂停记录
 esp_err_t TripHandler(httpd_req_t* req) {
     char query[64] = {};
     char value[16] = {};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "reset", value, sizeof(value)) == ESP_OK && atoi(value) != 0) {
-        if (!WriteAllowed(req)) {   // 清零是写操作
+    const bool has_query = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
+    const bool want_reset = has_query &&
+                            httpd_query_key_value(query, "reset", value, sizeof(value)) == ESP_OK &&
+                            atoi(value) != 0;
+    char rec_buf[16] = {};
+    const bool want_rec = has_query &&
+                          httpd_query_key_value(query, "rec", rec_buf, sizeof(rec_buf)) == ESP_OK;
+    if (want_reset || want_rec) {
+        if (!WriteAllowed(req)) {   // 清零/开关记录都是写操作
             return DenyWrite(req);
         }
-        atz_trip_reset();
+        if (want_reset) {
+            atz_trip_reset();
+            atz_trip_set_recording(true);   // 「重新开始统计」= 清零后立刻记录
+        }
+        if (want_rec) {
+            atz_trip_set_recording(atoi(rec_buf) != 0);
+        }
     }
     atz_trip_stats_t s = {};
     atz_trip_get(&s);
-    char body[384];
+    char body[448];
     snprintf(body, sizeof(body),
-             "samples=%lu uptime=%lu s\n"
+             "recording=%d  samples=%lu  session=%lu s\n"
              "max: rpm=%u speed=%u coolant=%d oil=%d intake=%d load=%d\n"
              "min batt=%.2f V   distance~%.2f km   above %d rpm: %lu s\n",
-             (unsigned long)s.samples, (unsigned long)s.uptime_s, (unsigned)s.max_rpm,
-             (unsigned)s.max_speed, (int)s.max_coolant, (int)s.max_oil, (int)s.max_intake,
-             (int)s.max_load, s.min_bat_mv / 1000.0, s.km_x100 / 100.0,
-             atz_rpm_ring_shift_rpm(), (unsigned long)s.above_shift_s);
+             (int)atz_trip_recording(), (unsigned long)s.samples, (unsigned long)s.uptime_s,
+             (unsigned)s.max_rpm, (unsigned)s.max_speed, (int)s.max_coolant, (int)s.max_oil,
+             (int)s.max_intake, (int)s.max_load, s.min_bat_mv / 1000.0, s.km_x100 / 100.0,
+             ATZ_TRIP_HOT_RPM, (unsigned long)s.hot_s);
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 
 // 台架用：量 UI 的真实流畅度 —— 直接读 LVGL 每帧的渲染事件，而不是"看着挺顺"。
-//   http://<设备IP>:8099/perf?seconds=5
-// 输出：帧率、平均每帧"渲染+刷屏"耗时、环定时器实际调用次数与真正触发重绘的次数。
-// 为什么要有这个：环的包围盒是 340×340，中间压着带缩放的表情图，每重绘一次都很贵；
-// 没有数字就只能猜（"是不是 CPU 不够""是不是缓冲区太小"）。
+//   http://<设备IP>:8099/perf
+// 输出：帧率、平均每帧"渲染+刷屏"耗时、每帧重绘像素、各 UI 模块改控件的次数。
+// 统计实现见 atz_perf.cc（★ 以前寄生在转速环里，环删掉后会静默变全 0，所以搬出来独立）。
 esp_err_t PerfHandler(httpd_req_t* req) {
     PerfSamplerStart();                     // 幂等；后台每 2 秒算一次
     const int64_t now_ms = esp_timer_get_time() / 1000;
@@ -796,13 +832,14 @@ esp_err_t PerfHandler(httpd_req_t* req) {
              "frames=%lu  ->  %lu.%lu fps\n"
              "avg frame busy=%lu us (render+flush)\n"
              "avg redraw=%lu px/frame   peak=%lu px\n"
-             "ring timer calls=%lu  real redraws=%lu\n"
+             "ring timer calls=%lu  ring redraws=%lu   ui redraws=%lu\n"
              "free heap=%lu bytes\n",
              (unsigned long)(age_ms == 0xFFFFFFFF ? 0 : age_ms), (unsigned long)g_perf.frames,
              (unsigned long)(g_perf.fps_x10 / 10), (unsigned long)(g_perf.fps_x10 % 10),
              (unsigned long)g_perf.avg_us, (unsigned long)g_perf.avg_px,
              (unsigned long)g_perf.peak_px, (unsigned long)g_perf.calls,
-             (unsigned long)g_perf.pushes, (unsigned long)esp_get_free_heap_size());
+             (unsigned long)g_perf.pushes, (unsigned long)g_perf.ui_pushes,
+             (unsigned long)esp_get_free_heap_size());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 // 台架用：查询/调整「表情图」与「顶部时间」的放大比例（立即生效，不用重刷固件）

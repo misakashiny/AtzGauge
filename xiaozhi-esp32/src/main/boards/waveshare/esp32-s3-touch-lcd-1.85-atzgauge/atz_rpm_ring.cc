@@ -26,13 +26,8 @@
 #include <esp_timer.h>
 #include <lvgl.h>
 
-// 直接读显示器的"失效区域"统计（LVGL 私有头，拿不到就退化成只报帧率/耗时）。
-// 为什么值得这么干：单帧耗时忽高忽低，只有知道**每次到底重绘了多少像素**才能判断
-// 瓶颈是"画得多"还是"帧太少"。
-#if __has_include("display/lv_display_private.h")
-#include "display/lv_display_private.h"
-#define ATZ_HAVE_DISP_PRIV 1
-#endif
+// 注：显示层的帧率/耗时/重绘像素统计已搬到 atz_perf.cc（/perf 端点用），
+// 本文件不再需要 LVGL 的私有头。
 
 #define TAG "AtzRpmRing"
 
@@ -55,8 +50,6 @@ int64_t g_alert_until_us = 0;      // 闪到什么时候
 int64_t g_alert_grace_us = 0;      // 告警解除后的余辉截止
 bool g_alert_on = false;           // 当前这一拍是不是"红"
 car_alarm_id_t g_alert_last_id = CAR_ALARM_NONE;
-int g_shift_rpm = ATZ_SHIFT_DEFAULT_RPM;    // 换挡提示阈值（0 = 关；NVS 持久化）
-bool g_shift_on = false;                    // 当前这一拍换挡灯是否亮
 int g_alert_signalled = -1;        // 上一次已提示的告警 id（-1 = 还没提示过）
 
 // 插值状态（见下面 RingTimerCb 的说明）
@@ -66,16 +59,9 @@ int g_pushed_value = -1;       // 上一次真正写进控件的值
 int64_t g_next_data_us = 0;    // 下次去车况缓存取数的时刻
 bool g_target_stale = true;
 
-// ── 性能统计（/perf 端点读它）────────────────────────────────────────────
-volatile uint32_t g_render_frames = 0;      // 完成的渲染帧数
-volatile uint64_t g_render_busy_us = 0;     // 渲染累计耗时（RENDER_START→RENDER_READY）
+// ── 本模块自己的计数（显示层的帧率/耗时统计已搬到 atz_perf.cc）────────────
 volatile uint32_t g_ring_calls = 0;         // 环定时器实际被调用的次数
 volatile uint32_t g_ring_pushes = 0;        // 其中真的改了控件的次数
-volatile uint64_t g_render_worst_us = 0;    // 最慢一帧
-volatile uint64_t g_inv_px_total = 0;       // 累计重绘像素
-volatile uint32_t g_inv_px_last = 0;        // 上一帧重绘像素
-volatile uint32_t g_inv_px_max = 0;         // 单帧最多重绘像素
-int64_t g_render_start_us = 0;
 
 constexpr uint32_t kColorWarn = ATZ_RPM_RING_WARN_COLOR;    // 琥珀（接近上限）
 constexpr uint32_t kColorAlarm = ATZ_RPM_RING_ALARM_COLOR;  // 红（超限；与 car_alarm / 车况页同色）
@@ -144,8 +130,8 @@ void StyleArc(void) {
 }
 
 /**
- * 决定外沿细环这一拍该是什么颜色。优先级：**告警红 > 换挡提示 > 主题色**。
- * 为什么告警优先：两者同时发生时，那是"故障"不是"该换挡了"，不能混淆。
+ * 决定外沿细环这一拍该是什么颜色。优先级：**告警红 > 主题色**。
+ * （2026-09-16 用户删掉换挡提示灯：车上已经有自己的换挡灯，屏幕上再闪一个反而分心。）
  */
 void ApplyBezelColor(void) {
     if (g_bezel == nullptr) {
@@ -154,8 +140,6 @@ void ApplyBezelColor(void) {
     uint32_t color = BezelColor();
     if (g_alert_on) {
         color = ATZ_ALERT_COLOR;
-    } else if (g_shift_on) {
-        color = ATZ_SHIFT_COLOR;
     }
     lv_obj_set_style_arc_color(g_bezel, lv_color_hex(color), LV_PART_MAIN);
     lv_obj_set_style_arc_opa(g_bezel, (lv_opa_t)ATZ_RPM_RING_BEZEL_OPA, LV_PART_MAIN);
@@ -214,7 +198,8 @@ void RingTimerCb(lv_timer_t* timer) {
             if ((int)id != g_alert_signalled) {
                 g_alert_signalled = (int)id;
                 g_alert_until_us = now_us + (int64_t)ATZ_ALERT_FLASH_MS * 1000;
-                ESP_LOGW(TAG, "visual alert: ring flashing (%s)", car_alarm_name(id));
+                ESP_LOGW(TAG, "visual alert: ring flashing (%s) [ring disabled -> log only]",
+                         car_alarm_name(id));
             }
             g_alert_grace_us = now_us + (int64_t)ATZ_ALERT_GRACE_MS * 1000;
         }
@@ -230,30 +215,10 @@ void RingTimerCb(lv_timer_t* timer) {
         }
     }
 
-    // ── 换挡提示灯（shift light）─────────────────────────────────────────
-    // 到阈值就让细环闪 ATZ_SHIFT_COLOR（比告警闪得快）。告警优先，见 ApplyBezelColor()。
-#if ATZ_SHIFT_ENABLE
-    if (g_bezel != nullptr && g_shift_rpm > 0) {
-        const bool above = (g_target_value >= g_shift_rpm);
-        const int64_t now_us2 = esp_timer_get_time();
-        const int64_t half_us = 1000000 / (ATZ_SHIFT_HZ * 2);
-        g_shift_on = above && (((now_us2 / half_us) % 2) != 0);
-    } else {
-        g_shift_on = false;
-    }
-#else
-    g_shift_on = false;
-#endif
-
-    // 颜色统一在这里落地（告警/换挡/正常三选一）
+    // 颜色统一在这里落地（告警红 / 主题色 二选一）
     if (g_bezel != nullptr) {
         static uint32_t s_last_color = 0xFFFFFFFF;
-        uint32_t want = BezelColor();
-        if (g_alert_on) {
-            want = ATZ_ALERT_COLOR;
-        } else if (g_shift_on) {
-            want = ATZ_SHIFT_COLOR;
-        }
+        uint32_t want = g_alert_on ? ATZ_ALERT_COLOR : BezelColor();
         if (want != s_last_color) {
             s_last_color = want;
             ApplyBezelColor();
@@ -440,9 +405,6 @@ void atz_rpm_ring_init(Display* display) {
 
     // 用户的开关状态（语音改过就写 NVS）：默认 = 编译期 ATZ_RPM_RING_ENABLE
     g_enabled = Settings(ATZ_UI_NVS_NAMESPACE, true).GetInt(ATZ_UI_NVS_KEY_RPM_RING, 1) != 0;
-    // 换挡提示阈值（语音可改，写 NVS）
-    g_shift_rpm = (int)Settings(ATZ_UI_NVS_NAMESPACE, true)
-                      .GetInt(ATZ_UI_NVS_KEY_SHIFT_RPM, ATZ_SHIFT_DEFAULT_RPM);
     atz_rpm_ring_set_enabled(g_enabled);
 
     ESP_LOGI(TAG, "rpm ring ready: d=%d w=%d (outer r=%d = screen edge), full scale=%d rpm "
@@ -492,26 +454,10 @@ bool atz_rpm_ring_enabled(void) {
     return g_enabled;
 }
 
-// ── 换挡提示灯（shift light）──────────────────────────────────────────────
-void atz_rpm_ring_set_shift_rpm(int rpm) {
-    if (rpm != 0 && rpm < ATZ_SHIFT_MIN_RPM) {
-        rpm = ATZ_SHIFT_MIN_RPM;      // 防手误：设成 800 会一路闪
-    }
-    if (rpm > ATZ_RPM_RING_MAX_RPM) {
-        rpm = ATZ_RPM_RING_MAX_RPM;
-    }
-    g_shift_rpm = rpm;
-    ESP_LOGI(TAG, "shift light %s (threshold %d rpm)", rpm > 0 ? "ON" : "OFF", rpm);
-}
-
-int atz_rpm_ring_shift_rpm(void) {
-    return g_shift_rpm;
-}
-
-void atz_rpm_ring_save_shift_rpm(int rpm) {
-    Settings(ATZ_UI_NVS_NAMESPACE, true).SetInt(ATZ_UI_NVS_KEY_SHIFT_RPM, rpm);
-    ESP_LOGI(TAG, "shift light threshold saved to NVS: %d", rpm);
-}
+// ── 换挡提示灯：已按用户要求整块删除（2026-09-16）──────────────────────────
+// 曾经的 atz_rpm_ring_set_shift_rpm / _shift_rpm / _save_shift_rpm 三个接口、
+// NVS 键 shift_rpm、以及细环闪绿灯的逻辑全部移除。车上本来就有换挡灯，
+// 屏幕再闪一个既分心又和"告警红"抢同一条细环。要恢复请看 git 历史。
 
 void atz_rpm_ring_set_visible(bool visible) {
     if (g_display == nullptr || g_arc == nullptr) {
@@ -562,39 +508,13 @@ void atz_rpm_ring_refresh(void) {
     RingTimerCb(nullptr);
 }
 
-void atz_rpm_ring_perf(char* buf, size_t len, uint32_t frames, uint64_t busy_us, uint32_t calls,
-                       uint32_t pushes) {
-    if (buf == nullptr || len == 0) {
-        return;
-    }
-    snprintf(buf, len, "frames=%lu busy=%llu us calls=%lu pushes=%lu", (unsigned long)frames,
-             (unsigned long long)busy_us, (unsigned long)calls, (unsigned long)pushes);
-}
-
-void atz_rpm_ring_perf_read(uint32_t* frames, uint64_t* busy_us, uint32_t* calls, uint32_t* pushes) {
-    if (frames != nullptr) {
-        *frames = g_render_frames;
-    }
-    if (busy_us != nullptr) {
-        *busy_us = g_render_busy_us;
-    }
+// 环自己的计数（显示层的帧率/耗时/重绘像素统计在 atz_perf.cc，见 /perf 端点）
+void atz_rpm_ring_perf_read(uint32_t* calls, uint32_t* pushes) {
     if (calls != nullptr) {
         *calls = g_ring_calls;
     }
     if (pushes != nullptr) {
         *pushes = g_ring_pushes;
-    }
-}
-
-void atz_rpm_ring_perf_ext(uint64_t* worst_us, uint64_t* inv_px, uint32_t* inv_max) {
-    if (worst_us != nullptr) {
-        *worst_us = g_render_worst_us;
-    }
-    if (inv_px != nullptr) {
-        *inv_px = g_inv_px_total;
-    }
-    if (inv_max != nullptr) {
-        *inv_max = g_inv_px_max;
     }
 }
 
@@ -606,20 +526,10 @@ bool atz_rpm_ring_visible(void) { return false; }
 void atz_rpm_ring_set_enabled(bool on) { (void)on; }
 bool atz_rpm_ring_enabled(void) { return false; }
 void atz_rpm_ring_save_enabled(bool on) { (void)on; }
-void atz_rpm_ring_set_shift_rpm(int rpm) { (void)rpm; }
-int atz_rpm_ring_shift_rpm(void) { return 0; }
-void atz_rpm_ring_save_shift_rpm(int rpm) { (void)rpm; }
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb) { (void)fg_rgb; }
 void atz_rpm_ring_refresh(void) {}
-void atz_rpm_ring_perf(char* buf, size_t len, uint32_t frames, uint64_t busy_us, uint32_t calls,
-                       uint32_t pushes) {
-    (void)buf; (void)len; (void)frames; (void)busy_us; (void)calls; (void)pushes;
-}
-void atz_rpm_ring_perf_read(uint32_t* frames, uint64_t* busy_us, uint32_t* calls, uint32_t* pushes) {
-    (void)frames; (void)busy_us; (void)calls; (void)pushes;
-}
-void atz_rpm_ring_perf_ext(uint64_t* worst_us, uint64_t* inv_px, uint32_t* inv_max) {
-    (void)worst_us; (void)inv_px; (void)inv_max;
+void atz_rpm_ring_perf_read(uint32_t* calls, uint32_t* pushes) {
+    (void)calls; (void)pushes;
 }
 
 #endif

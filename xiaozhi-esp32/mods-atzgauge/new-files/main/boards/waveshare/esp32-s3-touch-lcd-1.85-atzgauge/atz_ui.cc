@@ -11,6 +11,7 @@
 
 #include "assets/lang_config.h"
 #include "atz_arc_text.h"
+#include "atz_perf.h"
 #include "atz_rpm_ring.h"
 #include "atz_shot.h"
 #include "atz_trip.h"
@@ -255,7 +256,12 @@ void AtzLcdDisplay::SetupUI() {
     ApplyRoundScreenLayout();
     LogSizes();
 
-    // 屏幕外沿的转速圈（参考 obd_brz_gauge）：也始终生效，靠 ATZ_RPM_RING_ENABLE 单独控制
+    // 显示层性能统计（/perf 端点）：**必须在这里初始化**，否则 ATZ_RPM_RING_ENABLE=0
+    // 时没有任何模块去注册渲染事件回调，/perf 会静默变成全 0（等于工具坏了）。
+    atz_perf_init(this);
+
+    // 屏幕外沿的转速圈（参考 obd_brz_gauge）：也始终生效，靠 ATZ_RPM_RING_ENABLE 单独控制。
+    // ★ 2026-09-16 用户要求删除转速环 → ATZ_RPM_RING_ENABLE=0，这里退化成空函数调用。
     atz_rpm_ring_init(this);
     ApplyRingTheme();
 
@@ -1083,71 +1089,58 @@ void atz_ui_register_tools(AtzLcdDisplay* display) {
         });
 #endif  // ATZ_UI_ENABLE
 
-    // 转速环开关：用户说"把转速环关掉/打开"就调它（写 NVS，重启仍生效）
-    mcp_server.AddTool(
-        "self.ui.set_rpm_ring",
-        "Show or hide the RPM ring drawn along the edge of the screen (the ring that fills up "
-        "with engine RPM). Call this when the user says \"把转速环关掉\", \"不要那个圈\", "
-        "\"关掉转速环\", \"hide the rpm ring\", \"把转速环打开\", \"show the rpm ring\". "
-        "The choice is stored on the device and survives a reboot.",
-        PropertyList({Property("enabled", kPropertyTypeBoolean, true)}),
-        [](const PropertyList& properties) -> ReturnValue {
-            const bool on = properties["enabled"].value<bool>();
-            atz_rpm_ring_set_enabled(on);
-            atz_rpm_ring_save_enabled(on);      // 写 NVS：重启后仍生效
-            return std::string(on ? "rpm ring is now ON" : "rpm ring is now OFF");
-        });
+    // ── 转速环开关：**已删除**（2026-09-16 用户要求"转速环也删除掉"）──────────
+    // 环已从固件里编译掉（ATZ_RPM_RING_ENABLE=0），留着一个永远返回 "OFF" 的语音工具
+    // 只会让大模型以为还能开。要恢复：把配置改回 1 并找回这里原来的 self.ui.set_rpm_ring。
 
-    // ── 换挡提示灯（语音可设阈值）─────────────────────────────────────────
+    // ── 行程记录（语音开始/暂停/清零）─────────────────────────────────────
     mcp_server.AddTool(
-        "self.ui.set_shift_light",
-        "Set the shift-light RPM on the ring around the screen: when engine RPM reaches this value "
-        "the ring flashes green to tell the driver to shift up. Call this when the user says "
-        "\"换挡提示设到 6800\", \"换挡灯 7000 转\", \"set shift light to 6800\", "
-        "\"把换挡提示关掉\" -> rpm=0. Sensible range 2000~8000. It is stored on the device and "
-        "survives a reboot. Returns the value that is now in effect.",
-        PropertyList({Property("rpm", kPropertyTypeInteger, 0, 8000)}),
+        "self.car.set_trip_recording",
+        "Start or PAUSE the trip recording (the trip statistics on the trip page: distance, peak "
+        "RPM / speed / temperatures / load, minimum battery voltage, recording time). "
+        "Recording is OFF by default after boot, so the user must start it explicitly. "
+        "Call it when the user says \"开始记录行程\", \"开始记录\", \"帮我记一下这趟\", "
+        "\"start recording the trip\" -> recording=true; and \"暂停记录\", \"结束记录\", "
+        "\"别记了\", \"stop recording\" -> recording=false. "
+        "Pausing KEEPS the numbers (they just stop growing); use `self.car.reset_trip` to erase them. "
+        "Returns the state after the change.",
+        PropertyList({Property("recording", kPropertyTypeBoolean, true)}),
         [](const PropertyList& properties) -> ReturnValue {
-            const int rpm = properties["rpm"].value<int>();
-            atz_rpm_ring_set_shift_rpm(rpm);
-            atz_rpm_ring_save_shift_rpm(atz_rpm_ring_shift_rpm());   // 夹紧后再存
-            char msg[96];
-            const int now = atz_rpm_ring_shift_rpm();
-            if (now > 0) {
-                snprintf(msg, sizeof(msg), "shift light is now ON at %d rpm", now);
-            } else {
-                snprintf(msg, sizeof(msg), "shift light is now OFF");
-            }
-            return std::string(msg);
+            const bool on = properties["recording"].value<bool>();
+            atz_trip_set_recording(on);
+            return std::string(on ? "trip recording STARTED"
+                                  : "trip recording PAUSED (numbers kept, use reset to erase)");
         });
 
     // ── 行程统计（峰值保持）：用户问"最高水温多少"就调它 ────────────────
     mcp_server.AddTool(
         "self.car.get_trip",
-        "Report the trip statistics / peak values recorded since the last reset: estimated distance, "
-        "maximum RPM, maximum speed, peak coolant / oil / intake temperature, peak engine load, "
-        "minimum battery voltage, and how many seconds were spent above the shift-light RPM. "
+        "Report the trip statistics / peak values: estimated distance, maximum RPM, maximum speed, "
+        "peak coolant / oil / intake temperature, peak engine load, minimum battery voltage, how many "
+        "seconds were spent above the high-RPM threshold, and whether recording is ON or PAUSED. "
         "Call this when the user asks things like \"最高水温多少\", \"这一趟最高转速\", \"跑了多远\", "
-        "\"peak stats\", \"trip summary\". The numbers come from the car instrument over ESP-NOW; "
-        "if nothing has been received yet the tool says so explicitly.",
+        "\"peak stats\", \"trip summary\", \"记录在记吗\". The numbers come from the car instrument "
+        "over ESP-NOW; if recording has not been started the tool says so explicitly.",
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
             (void)properties;
-            char buf[320];
+            char buf[360];
             atz_trip_describe(buf, sizeof(buf));
             return std::string(buf);
         });
 
     mcp_server.AddTool(
         "self.car.reset_trip",
-        "Clear the trip statistics (peak values and distance) and start a new trip. Call this when "
-        "the user says \"行程清零\", \"重新开始统计\", \"reset the trip\". "
+        "Erase the trip statistics (peaks, distance, recording time) and start a NEW trip: the "
+        "numbers go back to zero and recording is switched ON, so the new trip begins immediately. "
+        "Call this when the user says \"行程清零\", \"清零重来\", \"重新开始统计\", \"reset the trip\". "
         "Ask for confirmation first if the user did not clearly intend to erase it.",
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
             (void)properties;
             atz_trip_reset();
-            return std::string("trip statistics cleared");
+            atz_trip_set_recording(true);
+            return std::string("trip statistics cleared, recording started");
         });
 
     // 顶栏图标（WiFi / 电量）：圆屏顶栏很窄，默认不显示 WiFi 图标。
