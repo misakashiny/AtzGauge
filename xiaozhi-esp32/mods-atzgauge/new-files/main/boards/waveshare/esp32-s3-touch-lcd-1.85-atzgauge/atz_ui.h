@@ -139,6 +139,8 @@ private:
     int64_t subtitle_freeze_at_ms_ = 0;
     bool subtitle_frozen_ = false;
     char subtitle_seen_[160] = {0};
+    /** 字幕静置超时清空的截止时刻（0 = 没有待清空的字幕）。见 TickSubtitleFreeze()。 */
+    int64_t subtitle_clear_at_ms_ = 0;
 
     /** 把当前主题的文字色套到屏幕外沿的转速圈上（要求已持有显示锁） */
     void ApplyRingTheme();

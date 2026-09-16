@@ -93,7 +93,22 @@ void TripTimerCb(lv_timer_t* timer) {
         return;
     }
 
-    // 只在"主表数据新鲜"时统计：否则 0 车速会被当成正常值、哨兵会被当成温度
+    // ── ① 记录时长：**只要在记录就累加，和数据有没有来无关** ─────────────────
+    // ★ 2026-09-17 用户实测报的 bug："点击下去有反应、但是时间不会跳动"。
+    //   原因：时长原本写在"数据新鲜"分支之后，而台架/停车状态下主表可能压根没数据，
+    //   于是时长永远停在 0:00:0X。时长是**用户按的那一下开始算的秒表**，
+    //   与"收到几条车况"是两件事，必须分开算。
+    if (dt_s > 0 && dt_s < 1.0) {
+        g_uptime_acc += dt_s;
+        if (g_uptime_acc >= 1.0) {
+            const uint32_t whole = (uint32_t)g_uptime_acc;
+            g_s.uptime_s += whole;
+            g_uptime_acc -= (double)whole;
+        }
+    }
+
+    // ── ② 峰值/里程：只在"主表数据新鲜"时统计 ────────────────────────────────
+    // 否则会把 0 车速、哨兵值（-40/-100）当峰值记进去
     const bool fresh = espnow_slave_has_data() && espnow_slave_last_rx_age_ms() >= 0 &&
                        espnow_slave_last_rx_age_ms() <= ATZ_UI_STALE_MS;
     if (!fresh) {
@@ -121,20 +136,10 @@ void TripTimerCb(lv_timer_t* timer) {
         g_s.min_bat_mv = s.bat_mv;
     }
 
-    // 里程估算 + 记录时长 + 高转时长：只有采样间隔合理（<1s）才累加，
-    // 避免调度抖动（比如 OTA/网络卡一下）把数字放大。
+    // 里程估算 + 高转时长：只有采样间隔合理（<1s）才累加，避免调度抖动放大数字
     if (dt_s > 0 && dt_s < 1.0) {
         const double m = (double)s.speed / 3.6 * dt_s;
         g_s.km_x100 += (uint32_t)(m / 10.0 + 0.5);   // 10 m = 0.01 km
-
-        // ★ 记录时长必须是"从按下开始记录起累计"的时间，不能拿 esp_timer/1000 ——
-        //   那是**开机**到现在的秒数，用户会看到"刚点开始就显示 35 秒"（真实踩过的坑）。
-        g_uptime_acc += dt_s;
-        if (g_uptime_acc >= 1.0) {
-            const uint32_t whole = (uint32_t)g_uptime_acc;
-            g_s.uptime_s += whole;
-            g_uptime_acc -= (double)whole;
-        }
 
         if (s.rpm >= ATZ_TRIP_HOT_RPM) {
             g_second_acc += dt_s;
@@ -146,7 +151,7 @@ void TripTimerCb(lv_timer_t* timer) {
         }
     }
 
-    g_s.samples++;   // 只统计"记录中且数据新鲜"的样本：暂停/断流时这一行到不了
+    g_s.samples++;   // 只统计"记录中且数据新鲜"的样本
 
 #if ATZ_TRIP_SAVE_S > 0
     if (now - g_last_save_us >= (int64_t)ATZ_TRIP_SAVE_S * 1000000) {

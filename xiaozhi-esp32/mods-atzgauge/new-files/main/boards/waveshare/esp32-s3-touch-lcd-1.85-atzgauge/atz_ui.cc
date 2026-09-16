@@ -10,6 +10,8 @@
 #include "atz_ui_config.h"
 
 #include "assets/lang_config.h"
+#include "application.h"
+#include "device_state.h"
 #include "atz_arc_text.h"
 #include "atz_perf.h"
 #include "atz_rpm_ring.h"
@@ -455,6 +457,14 @@ size_t AtzLcdDisplay::CopyChatText(char* buf, size_t len) {
 // 上游字幕是 LV_LABEL_LONG_SCROLL_CIRCULAR：**文本比框宽就永远滚**。
 // 实测：光这一项就让设备空闲时也跑 28fps（≈14% CPU 常年白烧）。
 // 做法：字幕一变就恢复滚动并重新计时；超过 ATZ_SUBTITLE_ROLL_MS 切到 CLIP（停住）。
+// ★★ 2026-09-17 追加：**超时自动清空**（ATZ_SUBTITLE_HOLD_S）。
+//   用户报"有时候主界面下面会一直显示 rpm 什么的是什么问题" —— 根因是：
+//   车况告警走的是 `Application::Alert()` → `SetChatMessage("system", "7100 rpm (limit 6500 rpm)")`，
+//   也就是**告警正文显示在字幕上**；而告警在超限期间会定期重发**同一条**文本，
+//   "文本没变 → 保持冻结"就让这行字永远停在屏幕上（告警解除后 `DismissAlert()`
+//   只在空闲态清字幕，若那时正好在说话/联网就不会清）。
+//   现在：字幕静置 ATZ_SUBTITLE_HOLD_S 秒后自动清空（说话/聆听中不清，避免把正在
+//   播报的字幕抹掉）。这条对所有"一句就完"的短消息都适用。
 void AtzLcdDisplay::TickSubtitleFreeze() {
 #if ATZ_SUBTITLE_FREEZE
     DisplayLockGuard lock(this);
@@ -463,6 +473,7 @@ void AtzLcdDisplay::TickSubtitleFreeze() {
     }
     const char* text = lv_label_get_text(chat_message_label_);
     const bool has_text = (text != nullptr && text[0] != '\0');
+    const int64_t now_ms = (int64_t)(esp_timer_get_time() / 1000);
 
     if (!has_text) {
         // 清空时把模式复位，否则下一条字幕会继承 CLIP（踩过：新字幕不滚，等于冻结功能失灵）
@@ -471,21 +482,34 @@ void AtzLcdDisplay::TickSubtitleFreeze() {
             subtitle_frozen_ = false;
         }
         subtitle_seen_[0] = '\0';
+        subtitle_clear_at_ms_ = 0;
         return;
     }
     if (strcmp(text, subtitle_seen_) != 0) {
         snprintf(subtitle_seen_, sizeof(subtitle_seen_), "%s", text);   // 新字幕
-        subtitle_freeze_at_ms_ = (int64_t)(esp_timer_get_time() / 1000) + ATZ_SUBTITLE_ROLL_MS;
+        subtitle_freeze_at_ms_ = now_ms + ATZ_SUBTITLE_ROLL_MS;
+        subtitle_clear_at_ms_ = now_ms + (int64_t)ATZ_SUBTITLE_HOLD_S * 1000;
         // ★ 无条件恢复滚动模式（不能只在 subtitle_frozen_ 为真时恢复：
         //   中间可能经历过"字幕被清空"，那时模式已经是 CLIP 了）
         lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
         subtitle_frozen_ = false;
         return;
     }
-    if (!subtitle_frozen_ && esp_timer_get_time() / 1000 >= subtitle_freeze_at_ms_) {
+    if (!subtitle_frozen_ && now_ms >= subtitle_freeze_at_ms_) {
         subtitle_frozen_ = true;
         lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_CLIP);   // 停住，不再滚动
     }
+#if ATZ_SUBTITLE_HOLD_S > 0
+    if (subtitle_clear_at_ms_ != 0 && now_ms >= subtitle_clear_at_ms_) {
+        const DeviceState st = Application::GetInstance().GetDeviceState();
+        if (st != kDeviceStateSpeaking && st != kDeviceStateListening) {
+            subtitle_clear_at_ms_ = 0;
+            subtitle_seen_[0] = '\0';
+            ESP_LOGI(TAG, "subtitle idle for %d s -> cleared", ATZ_SUBTITLE_HOLD_S);
+            SetChatMessage("system", "");
+        }
+    }
+#endif
 #endif
 }
 

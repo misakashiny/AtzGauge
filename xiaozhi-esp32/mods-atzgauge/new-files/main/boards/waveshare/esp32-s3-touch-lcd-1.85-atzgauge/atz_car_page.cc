@@ -52,10 +52,10 @@ LV_FONT_DECLARE(font_noto_sans_basic_30_4);   // 车况页两个主数值用（�
 // ── 可调参数 ────────────────────────────────────────────────────────────────
 #define ATZ_CAR_PAGE_REFRESH_MS   300     // 刷新周期
 #define ATZ_CAR_PAGE_STALE_MS     2000    // 超过这么久没数据 → 整页视为"无数据"
-#define ATZ_CAR_PAGE_COL_W        300     // 内容列宽（圆屏中部最宽约 350）
-#define ATZ_CAR_PAGE_CELL_W       142     // 网格单元宽（两列 + 间距正好 ≤ 列宽）
+#define ATZ_CAR_PAGE_COL_W        232     // 内容列宽（★ 由圆屏公式解出来的：见 ATZ_CAR_COL_Y 的说明）
+#define ATZ_CAR_PAGE_CELL_W       108     // 网格单元宽（两列 + 间距 8 = 232 = 列宽）
 #define ATZ_CAR_PAGE_GRID_GAP     8       // 网格列间距
-#define ATZ_CAR_PAGE_GRID_ROW_GAP 4       // 网格行间距
+#define ATZ_CAR_PAGE_GRID_ROW_GAP 3       // 网格行间距（从 4 收到 3：为的是让整个内容列落在 y=27..315 内）
 
 // ── 圆形屏"某个 y 处能放多宽"的唯一公式 ─────────────────────────────────────
 // 半径 180、圆心 y=179.5 时，dy 处的可视宽度 ≈ 2*sqrt(180² - dy²)。
@@ -70,34 +70,47 @@ static inline int SafeWidthAt(int y) {
 }
 
 // ── 底部提示 / 状态文字的位置（★ 修"两行字叠在一起"）────────────────────────
-// 以前 g_stale_label(y=+152→屏幕 y=331) 和 g_hint_label(y=+150→屏幕 y=329) **差 2px**，
-// 同时出现时就是一团糊字。现在分工明确、各占一行：
-//   y=302（dy=123 → 可用 ~262px）无数据提示
-//   y=332（dy=153 → 可用 ~189px）翻页提示
-#define ATZ_CAR_STALE_Y           296
-#define ATZ_CAR_HINT_Y            326
+// 以前 g_stale_label 与 g_hint_label **只差 2px**，同时出现时就是一团糊字。
+// 现在各占一行，且都在圆内（判据：四角最远 ≤176，R=180）：
+//   「检查主表与信道」140px → y∈19..310 → 取 276
+//   「行程统计」100px       → y∈11..318 → 取 308（必须和上面那行错开，行盒 31px）
+#define ATZ_CAR_STALE_Y           276
+#define ATZ_CAR_HINT_Y            308
+// 车况页内容列（hero 行 + 字段网格）的顶部位置。
+// ★ 这个 y 与列宽是**联立解出来的**，别单独改其中一个。
+//   内容列固有高度 = hero 105 + 行距 8 + 网格(4 行 × 31 + 3×3 间距 = 133) = 246px。
+//   要求整列**四个角**都在圆内（R=180，圆心 179.5），并留 ≥4px 余量：
+//     列宽 216 → y 允许 41..73 ；232 → 48..66 ；240 → 51..63（窗口仅 13px，太脆）
+//     列宽 280 → **无解** ✗（实测四角最远 206.7 —— 用户在屏幕上看到的就是这个）
+//   最终 列宽 232 + y=56 → 内容占 56..301，最坏角距 174.2 ✓
+#define ATZ_CAR_COL_Y             56
 
 // 「行程」页（page1）
-// ★ 这一页的几何是**量出来的**，不是拍脑袋：360×360 圆屏上，四行双行卡片(62px)要 260px，
-//   而状态行 + 按钮行已经吃掉顶部约 60px，剩下的可用高度只有 ~245px → 第四行必被圆边切掉
-//   （实测：布局里最后一行落在 y=369，已经出屏）。所以最终收敛成：
-//     状态行(y=6) / 按钮行(y=38, 26px) / 六张卡片 3 行(y=104..264, 每格 142×50)
-#define ATZ_TRIP_PAGE_CELL_W      142     // 卡宽（与车况页同宽）
-#define ATZ_TRIP_PAGE_CELL_H      50      // 卡高 = 项目名 21px + 数值 29px（故意让两行贴紧）
-#define ATZ_TRIP_PAGE_CARDS       6       // 行程页的数据卡数量（受圆屏高度限制，6 张正好）
-// 行程页顶部两行的位置（★ 都用 LV_ALIGN_TOP_MID，理由见 BuildTripPage 里的说明）
-//  y=6  → 状态行（dy=173，可用 ~198px；"● 记录中 1:23:45" 实测 155~200px）
-//  y=38 → 按钮行（dy=141，可用 ~224px；两个按钮 156+8+150=314px 会超出圆边！）
-//  ★ 按钮宽度必须按 y=51（按钮中心）算：dy=128 → 可用 ~253px。
-//    所以按钮行宽度上限取 250，两个按钮 120+8+120 正好。
-#define ATZ_TRIP_HDR_Y            0       // 头部容器（状态行 + 按钮行都挂在它下面）
-#define ATZ_TRIP_HDR_H            65      // 头部高度（状态行 31 + 空隙 + 按钮 26）
-#define ATZ_TRIP_TITLE_Y          4       // 状态行（相对头部容器；再往下会和按钮那一行的字贴上）
-#define ATZ_TRIP_BTN_Y            38      // 按钮行（相对头部容器）
+// ★ 同样是解出来的（判据同上，留 ≥4px 余量）：
+//     「记录中」状态行 70×31            → y ∈ 8..321  → 取 2
+//     按钮行 208×26（两个 100 + 间距 8）→ y ∈ 38..296 → 取 28
+//     卡片网格（3 行）→ 见下面的取值
+//     「行程统计」110×31                → y ∈ 11..318 → 取 308
+// ★ 卡片尺寸是解出来的（三列试过、不行）：圆屏 y=140 处的可用宽度只有 260px，
+//   而 3 列布局的整行宽 353px → 左右两张卡被圆边切掉（实测角距 196.6 ✗）。
+//   两列布局：整行 344px，但**每一张卡自己**只有 170px，卡片四角都能落进圆内：
+//     第一张 (8,122)-(177,183) → 最远角 174.6 ✓   第三行 (8,252)-(177,313) → 175.6 ✓
+#define ATZ_TRIP_PAGE_CELL_W      168     // 卡宽（两列 168 + 间距 8 = 344）
+#define ATZ_TRIP_PAGE_CELL_H      31      // ★ 单行高：名字与数值**同一行**（宽敞了就放得下：
+//                                        「转速」40 + 「7100rpm」88 = 128 ≤ 168 ✓）
+#define ATZ_TRIP_PAGE_GRID_GAP    8       // 行程页列间距
+#define ATZ_TRIP_PAGE_GRID_ROW_GAP 4      // 行程页行间距
+#define ATZ_TRIP_PAGE_CARDS       6       // 行程页的数据卡数量（2 列 × 3 行）
+#define ATZ_TRIP_HDR_Y            0       // 头部容器（状态行/时长/按钮行都挂在它下面）
+#define ATZ_TRIP_HDR_H            66      // 头部高度（状态行 2..33 + 空隙 + 按钮 38..64）
+#define ATZ_TRIP_TITLE_Y          2       // 「记录中 / 已暂停」（不带 ● —— emoji 字体缺这个字形）
+#define ATZ_TRIP_BTN_Y            38      // 按钮行（★ 必须在状态行下面；y<38 时按钮的角会出圆）
+// 已记录时长放**底部提示行**（「返回车况 0:04」）：顶部 y=2..68 那一段可用宽只有 247px，
+// 状态 + 时长 + 按钮三样并排放不下（实测：时长和按钮都放在 y=38 时完全重叠）。
 #define ATZ_TRIP_BTN_H            26      // 按钮高度（★ 触摸目标：越高越好按）
-#define ATZ_TRIP_BTN_W            120     // 单个按钮宽（两个 + 8 间距 = 248 ≤ 250）
-#define ATZ_TRIP_HINT_Y           326     // 底部翻页提示（与车况页的提示同一行）
-#define ATZ_TRIP_COL_Y            104     // 数据网格（用 TOP_MID 定位，不用 CENTER）
+#define ATZ_TRIP_BTN_W            100     // 单按钮宽（两个 + 8 间距 = 208）
+#define ATZ_TRIP_HINT_Y           304     // 底部提示（「返回车况 0:04」150px → y 允许 21..308）
+#define ATZ_TRIP_COL_Y            122     // 数据网格（grid 122..259，四角全在圆内）
 
 // 配色（参考 obd_brz_gauge 的深色仪表风）
 #define ATZ_PAGE_BG        0x000000
@@ -127,7 +140,7 @@ lv_obj_t* g_hint_label = nullptr;   // 底部一行小字：提示"点一下看�
 int g_page_no = 0;                  // 0 = 车况，1 = 行程
 lv_obj_t* g_trip_hdr = nullptr;     // 行程页头部容器（状态行 + 按钮行；隐藏它一个就够）
 lv_obj_t* g_trip_col = nullptr;     // 行程页数据网格所在列（flex column）
-lv_obj_t* g_trip_title = nullptr;   // 「● 记录中 · 0:12:34」状态行
+lv_obj_t* g_trip_title = nullptr;   // 「记录中 / 已暂停」（第 1 行）
 lv_obj_t* g_trip_grid = nullptr;    // 数据卡网格（flex row wrap）
 lv_obj_t* g_trip_status = nullptr;  // 操作结果提示（点按钮后回一句）
 lv_obj_t* g_rec_btn = nullptr;
@@ -509,17 +522,20 @@ void BuildPage(lv_obj_t* screen) {
     lv_obj_set_scrollbar_mode(g_page, LV_SCROLLBAR_MODE_OFF);
 
     // ── 顶部：链路状态 ─────────────────────────────────────────────────────
-    // ★ 圆屏约束：y=-150 处的可用宽度只有 2*sqrt(180²-150²) ≈ 198px（20px 字约 10 个汉字），
-    //   所以这里的文字必须短。
+    // ★ 圆屏约束：文本行盒的**四角**必须在圆内。y=15..45 / 宽 130 时最坏角距 176.7 < 179.5 ✓
+    //   （这就是为什么顶部文字必须短：y 越小可用宽越窄）
     g_link_label = MakeLabel(g_page, "● 车况", ATZ_PAGE_BAD, nullptr);
     lv_obj_set_style_text_align(g_link_label, LV_TEXT_ALIGN_CENTER, 0);
-    PlaceAt(g_link_label, 0, -150);
+    lv_obj_align(g_link_label, LV_ALIGN_TOP_MID, 0, 15);
 
-    // ── 内容列（flex column，整体居中；隐藏字段后自动收缩并保持居中） ──────
+    // ── 内容列（flex column；隐藏字段后自动收缩并保持居中）──────────────────
+    // ★ 用 TOP_MID 定位而不是 CENTER：CENTER 依赖对象高度，而 flex 容器的高度要等布局
+    //   算完才知道（缺陷 #23 就是这么错位 100+px 的）。这里 y=27 → 网格末行落在 y=258，
+    //   而 y=258 处可用宽 285px ≥ 列宽 280px，四角全部在圆内。
     g_col = MakeBox(g_page);
     lv_obj_set_width(g_col, ATZ_CAR_PAGE_COL_W);
     lv_obj_set_height(g_col, LV_SIZE_CONTENT);
-    lv_obj_align(g_col, LV_ALIGN_CENTER, 0, 6);
+    lv_obj_align(g_col, LV_ALIGN_TOP_MID, 0, ATZ_CAR_COL_Y);
     lv_obj_set_flex_flow(g_col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(g_col, 8, 0);
@@ -554,7 +570,7 @@ void BuildPage(lv_obj_t* screen) {
     lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
 
     // y=332「▾ 行程统计」：翻页按钮的提示（本身就是一块点击区，见下方 RegisterHitZones）
-    g_hint_label = MakeLabel(g_page, "▾ 行程统计", ATZ_PAGE_STALE, nullptr);
+    g_hint_label = MakeLabel(g_page, "行程统计", ATZ_PAGE_STALE, nullptr);
     lv_obj_set_style_text_align(g_hint_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_hint_label, LV_ALIGN_TOP_MID, 0, ATZ_CAR_HINT_Y);
 
@@ -649,21 +665,30 @@ void RefreshTripPage(void) {
     atz_trip_get(&t);
     const bool rec = atz_trip_recording();
 
-    // ── 状态行：记录中 / 已暂停 + 已记录时长 ───────────────────────────────
+    // ── 状态行：记录中 / 已暂停（第 1 行）+ 已记录时长（第 2 行）─────────────
+    //    ★ 为什么拆成两行：圆形屏顶部 y=8..68 那一段可用宽度只有 ~250px，
+    //      "● 记录中 1:23:45" 并成一行要 330px，**根本放不下**（实测算过）。
+    //      拆开之后每行都只占 ~70px，稳稳在圆内。
     //    ★ 时长必须是"从按下开始记录起累计"的秒数（atz_trip 里累加），不是开机秒数。
-    //    ★ 圆屏 y=-152 处只有约 193px ≈ 9 个 20px 汉字，所以文字要短：
-    //      "● 记录中 1:23:45" = 11 字符宽（英文/数字更窄）刚好放得下。
     if (g_trip_title != nullptr) {
-        char text[40];
-        const uint32_t sec = t.uptime_s;
-        snprintf(text, sizeof(text), "%s %lu:%02lu:%02lu", rec ? "● 记录中" : "● 已暂停",
-                 (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60),
-                 (unsigned long)(sec % 60));
-        if (strcmp(lv_label_get_text(g_trip_title), text) != 0) {
-            lv_label_set_text(g_trip_title, text);
+        const char* want = rec ? "记录中" : "已暂停";
+        if (strcmp(lv_label_get_text(g_trip_title), want) != 0) {
+            lv_label_set_text(g_trip_title, want);
             atz_perf_count_push();
         }
-        lv_obj_set_style_text_color(g_trip_title, lv_color_hex(rec ? ATZ_PAGE_OK : ATZ_PAGE_STALE), 0);
+        lv_obj_set_style_text_color(g_trip_title,
+                                    lv_color_hex(rec ? ATZ_PAGE_OK : ATZ_PAGE_STALE), 0);
+    }
+    // 已记录时长显示在**底部提示**里（「返回车况 0:04」）：顶部那一段可用宽只有 247px，
+    // 状态 + 时长 + 按钮并排放不下（实测：时长和按钮都放同一行时完全重叠）。
+    if (g_trip_hint != nullptr) {
+        char text[40];
+        const uint32_t sec = t.uptime_s;
+        snprintf(text, sizeof(text), "返回车况 %lu:%02lu:%02lu", (unsigned long)(sec / 3600),
+                 (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
+        if (strcmp(lv_label_get_text(g_trip_hint), text) != 0) {
+            lv_label_set_text(g_trip_hint, text);
+        }
     }
     if (g_rec_btn_label != nullptr) {
         const char* want = rec ? "暂停记录" : "开始记录";
@@ -776,7 +801,7 @@ void MakePill(lv_obj_t* btn, uint32_t border_rgb, int w, int h) {
 
 void BuildTripPage(lv_obj_t* parent) {
     g_trip_col = MakeBox(parent);
-    lv_obj_set_width(g_trip_col, ATZ_CAR_PAGE_COL_W);
+    lv_obj_set_width(g_trip_col, 2 * ATZ_TRIP_PAGE_CELL_W + ATZ_TRIP_PAGE_GRID_GAP);
     lv_obj_set_height(g_trip_col, LV_SIZE_CONTENT);
     // ★ 这里也改用 TOP_MID：LV_ALIGN_CENTER 依赖对象高度，而高度此刻还是
     //   LV_SIZE_CONTENT(0)，实测会被放到屏幕正中并与按钮行叠在一起。
@@ -788,17 +813,19 @@ void BuildTripPage(lv_obj_t* parent) {
 
     // ── 数据卡网格 ────────────────────────────────────────────────────────
     g_trip_grid = MakeBox(g_trip_col);
-    lv_obj_set_width(g_trip_grid, ATZ_CAR_PAGE_COL_W);
+    // 行程页网格：两列 168 + 间距 8 = 344（每张卡自己 168 宽，四角都在圆内）
+    lv_obj_set_width(g_trip_grid, 2 * ATZ_TRIP_PAGE_CELL_W + ATZ_TRIP_PAGE_GRID_GAP);
     lv_obj_set_height(g_trip_grid, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(g_trip_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(g_trip_grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(g_trip_grid, ATZ_CAR_PAGE_GRID_GAP, 0);
-    lv_obj_set_style_pad_row(g_trip_grid, ATZ_CAR_PAGE_GRID_ROW_GAP, 0);
+    lv_obj_set_style_pad_column(g_trip_grid, ATZ_TRIP_PAGE_GRID_GAP, 0);
+    lv_obj_set_style_pad_row(g_trip_grid, ATZ_TRIP_PAGE_GRID_ROW_GAP, 0);
 
     for (int i = 0; i < ATZ_TRIP_PAGE_CARDS; i++) {
         lv_obj_t* card = MakeBox(g_trip_grid);
         lv_obj_set_size(card, ATZ_TRIP_PAGE_CELL_W, ATZ_TRIP_PAGE_CELL_H);
+        // 名字 + 数值同一行（168px 宽够放：「转速」40 + 「7100rpm」88 = 128 ✓）
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                               LV_FLEX_ALIGN_CENTER);
@@ -829,7 +856,7 @@ void BuildTripPage(lv_obj_t* parent) {
     lv_obj_set_size(g_trip_hdr, LV_HOR_RES, ATZ_TRIP_HDR_H);
     lv_obj_align(g_trip_hdr, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_HDR_Y);
 
-    g_trip_title = MakeLabel(g_trip_hdr, "● 已暂停", ATZ_PAGE_STALE, nullptr);
+    g_trip_title = MakeLabel(g_trip_hdr, "已暂停", ATZ_PAGE_STALE, nullptr);
     lv_obj_set_style_text_align(g_trip_title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_trip_title, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_TITLE_Y);
 
@@ -858,7 +885,7 @@ void BuildTripPage(lv_obj_t* parent) {
     lv_obj_add_event_cb(g_reset_btn, ResetBtnCb, LV_EVENT_CLICKED, nullptr);
 
     // ── 底部翻页提示（y=332，dy=153 → 可用 ~189px）：文字短、本身就是点击区 ──
-    g_trip_hint = MakeLabel(parent, "▴ 返回车况", ATZ_PAGE_STALE, nullptr);
+    g_trip_hint = MakeLabel(parent, "返回车况", ATZ_PAGE_STALE, nullptr);
     lv_obj_set_style_text_align(g_trip_hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_trip_hint, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_HINT_Y);
 
