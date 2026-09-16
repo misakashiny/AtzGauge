@@ -15,6 +15,7 @@
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -147,8 +148,20 @@ esp_err_t ShotHandler(httpd_req_t* req) {
     return err;
 }
 
+// 探活 + **版本探针**：第一行仍是 "ok"（脚本里原有的判断不受影响），
+// 后面跟固件标识与关键开关 —— 以后不用再猜"设备上跑的是哪一版"。
 esp_err_t HealthHandler(httpd_req_t* req) {
-    return httpd_resp_send(req, "ok", HTTPD_RESP_USE_STRLEN);
+    char body[320];
+    snprintf(body, sizeof(body),
+             "ok\n"
+             "fw=%s %s\n"
+             "built=%s\n"
+             "switches: ATZ_UI_ENABLE=%d rpm_ring=%d arc_text=%d wifi_icon=%d\n"
+             "uptime=%lu s  heap=%lu B\n",
+             ATZ_FW_NAME, ATZ_FW_STAGE, ATZ_FW_BUILT, ATZ_UI_ENABLE, ATZ_RPM_RING_ENABLE,
+             ATZ_ARC_TEXT_ENABLE, ATZ_SHOW_NETWORK_ICON, (unsigned long)(esp_timer_get_time() / 1000000),
+             (unsigned long)esp_get_free_heap_size());
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 
 // 台架用：从 PC 直接切主题，不必对着设备说话。

@@ -780,6 +780,11 @@ private:
 
 public:
     AtzGaugeBoard() {   
+        // 开机第一条日志就把"这是哪一版固件"说清楚：名字、阶段、构建时间、关键开关。
+        // 台架上排查时最常问的就是"设备里现在跑的是哪版"，以前只能比对日志猜。
+        ESP_LOGI(TAG, "=== firmware: %s %s | built %s | UI=%d ring=%d arc_text=%d ===",
+                 ATZ_FW_NAME, ATZ_FW_STAGE, ATZ_FW_BUILT, ATZ_UI_ENABLE, ATZ_RPM_RING_ENABLE,
+                 ATZ_ARC_TEXT_ENABLE);
         InitializeI2c();
         InitializeTca9554();
         InitializeSpi();
