@@ -1,0 +1,46 @@
+# D:\AtzGauge —— 只纳管「知识资产」，不纳管上游代码 / 构建产物 / 依赖 / 截图。
+#
+# 为什么用白名单（/* 再 ! 放行）而不是黑名单：
+#   这个目录一共 1.28 GB，其中 xiaozhi-esp32 就占 1.19 GB（src\build 406 MB +
+#   src\managed_components 735 MB）。黑名单只要漏写一条，就可能把几百 MB 提进仓库；
+#   白名单则相反 —— 只跟踪下面显式放行的那几块（合计约 0.93 MB / 111 个文件）。
+#
+# 放行清单（= 这个项目的全部"记忆"）：
+#   开发参考\                     台账/清单/几何总表（18/19/20/21 等）
+#   tools\                        构建、刷机、日志、会话体检、尺寸量测等脚本
+#   xiaozhi-esp32\mods-atzgauge\  官方升级重打套件（patch + 块 + 校验脚本）
+#   xiaozhi-esp32\src\main\espnow_slave\                     从表/车况/告警实现
+#   xiaozhi-esp32\src\main\boards\waveshare\...-atzgauge\    板型（UI/车况页/转速环/端点）
+
+/*
+!/.gitignore
+!/开发参考/
+!/tools/
+
+# ── 小智固件侧：只跟"我们自己写的"两块 ──────────────────────────────
+!/xiaozhi-esp32/
+/xiaozhi-esp32/*
+!/xiaozhi-esp32/mods-atzgauge/
+!/xiaozhi-esp32/src/
+/xiaozhi-esp32/src/*
+!/xiaozhi-esp32/src/main/
+/xiaozhi-esp32/src/main/*
+!/xiaozhi-esp32/src/main/espnow_slave/
+!/xiaozhi-esp32/src/main/boards/
+/xiaozhi-esp32/src/main/boards/*
+!/xiaozhi-esp32/src/main/boards/waveshare/
+/xiaozhi-esp32/src/main/boards/waveshare/*
+!/xiaozhi-esp32/src/main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/
+
+# ── 明确排除（即使将来白名单放宽也不要收）────────────────────────
+build/
+managed_components/
+node_modules/
+firmware/
+upstream/
+backup/
+*.bin
+*.elf
+*.map
+sdkconfig
+sdkconfig.old

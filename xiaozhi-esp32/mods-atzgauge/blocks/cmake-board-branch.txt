@@ -1,0 +1,19 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# AtzGauge 追加块 1/2：板型选择分支（结束标记在本块末尾）
+# 上游升级后要重新插入的就是这一块 —— 锚点：官方 1.85 分支
+#   elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85)   之前
+# 说明见 xiaozhi-esp32/mods-atzgauge/MODIFICATIONS.md
+# ══════════════════════════════════════════════════════════════════════════════
+elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85_ATZGAUGE)
+    set(BOARD_DIR "waveshare/esp32-s3-touch-lcd-1.85-atzgauge")
+    # 字号档位（本项目可调项之一）：官方 1.85 用 16px。1.85" 屏上车内偏小，
+    # 改成 20px 档。想回退：把这两行换回 *_16_4 即可（见板型目录 atz_ui_config.h 说明）。
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
+    # 官方 1.85 板型用 64px 表情。本板屏幕是 360x360，64px 显得又小又空，
+    # 所以改用 128px 的原始素材（不是把 64px 拉伸放大，所以不会糊）。
+    # 代价：资产分区从约 1.26MB 涨到约 2.4MB（分区共 8MB，够用）。
+    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
+# ══════════════════════════════════════════════════════════════════════════════
+# AtzGauge 追加块 1/2 结束（本块 = 板型选择链里的一个分支；开始标记见上一处）
+# ══════════════════════════════════════════════════════════════════════════════

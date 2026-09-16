@@ -1,0 +1,9 @@
+    config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85_ATZGAUGE
+        bool "Waveshare ESP32-S3-Touch-LCD-1.85 (AtzGauge voice slave)"
+        depends on IDF_TARGET_ESP32S3
+        help
+            Same hardware as the stock 1.85 board, but adds the ESP-NOW slave that
+            receives vehicle data broadcast by the AtzGauge instrument master.
+            Kept as a SEPARATE board identity on purpose: board type/name determines
+            the OTA upgrade channel, so reusing the stock name would let the official
+            firmware silently overwrite this build.

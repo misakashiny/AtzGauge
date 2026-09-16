@@ -1,0 +1,78 @@
+diff --git a/a/main/CMakeLists.txt b/b/main/CMakeLists.txt
+index 08df008..4368dc6 100644
+--- a/a/main/CMakeLists.txt
++++ b/b/main/CMakeLists.txt
+@@ -409,6 +409,25 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85B)
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+     set(BUILTIN_ICON_FONT font_material_symbols_16_4)
+     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
++# ══════════════════════════════════════════════════════════════════════════════
++# AtzGauge 追加块 1/2：板型选择分支（结束标记在本块末尾）
++# 上游升级后要重新插入的就是这一块 —— 锚点：官方 1.85 分支
++#   elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85)   之前
++# 说明见 xiaozhi-esp32/mods-atzgauge/MODIFICATIONS.md
++# ══════════════════════════════════════════════════════════════════════════════
++elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85_ATZGAUGE)
++    set(BOARD_DIR "waveshare/esp32-s3-touch-lcd-1.85-atzgauge")
++    # 字号档位（本项目可调项之一）：官方 1.85 用 16px。1.85" 屏上车内偏小，
++    # 改成 20px 档。想回退：把这两行换回 *_16_4 即可（见板型目录 atz_ui_config.h 说明）。
++    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
++    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
++    # 官方 1.85 板型用 64px 表情。本板屏幕是 360x360，64px 显得又小又空，
++    # 所以改用 128px 的原始素材（不是把 64px 拉伸放大，所以不会糊）。
++    # 代价：资产分区从约 1.26MB 涨到约 2.4MB（分区共 8MB，够用）。
++    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
++# ══════════════════════════════════════════════════════════════════════════════
++# AtzGauge 追加块 1/2 结束（本块 = 板型选择链里的一个分支；开始标记见上一处）
++# ══════════════════════════════════════════════════════════════════════════════
+ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85)
+     set(BOARD_DIR "waveshare/esp32-s3-touch-lcd-1.85")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+@@ -1075,6 +1094,27 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
+         sdmmc
+     )
+ endif()
++
++# ══════════════════════════════════════════════════════════════════════════════
++# AtzGauge 追加块 2/2：ESP-NOW 从表源码与头文件路径
++#
++# 故意集中成一个 list(APPEND ...) 块，而不是插到上面那几个大列表里 ——
++# 这样相对上游只有一处连续改动，官方升级后按锚点（下一行的 idf_component_register）
++# 重新插入即可。完整说明见 xiaozhi-esp32/mods-atzgauge/MODIFICATIONS.md
++# ══════════════════════════════════════════════════════════════════════════════
++list(APPEND SOURCES
++    "espnow_slave/obd_data_cache.c"
++    "espnow_slave/espnow_link.c"
++    "espnow_slave/car_alarm.cc"
++    "espnow_slave/car_status_tool.cc"
++)
++list(APPEND INCLUDE_DIRS "espnow_slave")
++# ESP-NOW 的 API 在 esp_wifi 组件里。上游已经把 MAIN_PRIV_REQUIRES_EXTRA 这个扩展点
++# 接进了 idf_component_register()，所以这里直接追加，不用去改那个大 REQUIRES 列表
++# （少一处散落改动 = 官方升级时少一处要重打）。
++list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_wifi)
++# ══════════════════════════════════════════════════════════════════════════════
++
+ idf_component_register(SRCS ${SOURCES}
+                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                     INCLUDE_DIRS ${INCLUDE_DIRS}
+diff --git a/a/main/Kconfig.projbuild b/b/main/Kconfig.projbuild
+index 8d5ae70..66217db 100644
+--- a/a/main/Kconfig.projbuild
++++ b/b/main/Kconfig.projbuild
+@@ -563,6 +563,15 @@ choice BOARD_TYPE
+     config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C
+         bool "Waveshare ESP32-S3-Touch-LCD-1.85C"
+         depends on IDF_TARGET_ESP32S3
++    config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85_ATZGAUGE
++        bool "Waveshare ESP32-S3-Touch-LCD-1.85 (AtzGauge voice slave)"
++        depends on IDF_TARGET_ESP32S3
++        help
++            Same hardware as the stock 1.85 board, but adds the ESP-NOW slave that
++            receives vehicle data broadcast by the AtzGauge instrument master.
++            Kept as a SEPARATE board identity on purpose: board type/name determines
++            the OTA upgrade channel, so reusing the stock name would let the official
++            firmware silently overwrite this build.
+     config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_49
+         bool "Waveshare ESP32-S3-Touch-LCD-3.49"
+         depends on IDF_TARGET_ESP32S3

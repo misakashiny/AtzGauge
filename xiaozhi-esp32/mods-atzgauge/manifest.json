@@ -1,0 +1,103 @@
+{
+  "generatedAt": "2026-09-15T23:24:44.809Z",
+  "baseline": "78/xiaozhi-esp32 v2.5.0 (codeload tar.gz)",
+  "currentTree": "D:/AtzGauge/xiaozhi-esp32/src",
+  "upstreamTree": "D:/AtzGauge/upstream/xiaozhi-esp32-2.5.0",
+  "modifiedUpstreamFiles": [
+    "main/CMakeLists.txt",
+    "main/Kconfig.projbuild"
+  ],
+  "addedFiles": [
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_arc_text.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_arc_text.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_car_page.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_car_page.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_rpm_ring.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_rpm_ring.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_shot.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_shot.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_touch.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_ui.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_ui.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_ui_config.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/config.h",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/config.json",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/esp32-s3-touch-lcd-1.85-atzgauge.cc",
+    "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/README.md",
+    "main/espnow_slave/car_alarm.cc",
+    "main/espnow_slave/car_alarm.h",
+    "main/espnow_slave/car_status_tool.cc",
+    "main/espnow_slave/car_status_tool.h",
+    "main/espnow_slave/espnow_link.c",
+    "main/espnow_slave/espnow_link.h",
+    "main/espnow_slave/obd_data_cache.c",
+    "main/espnow_slave/obd_data_cache.h"
+  ],
+  "deletedUpstreamFiles": [],
+  "patchFile": "modified-upstream.patch",
+  "newFilesDir": "new-files",
+  "blocks": [
+    {
+      "id": "cmake-board-branch",
+      "file": "blocks/cmake-board-branch.txt",
+      "lines": 19
+    },
+    {
+      "id": "cmake-sources-includes",
+      "file": "blocks/cmake-sources-includes.txt",
+      "lines": 21
+    },
+    {
+      "id": "kconfig-board",
+      "file": "blocks/kconfig-board.txt",
+      "lines": 9
+    }
+  ],
+  "anchors": [
+    {
+      "file": "main/CMakeLists.txt",
+      "id": "cmake-board-branch",
+      "description": "AtzGauge 板型选择分支（追加块 1/2）",
+      "startMarker": "AtzGauge 追加块 1/2：板型选择分支",
+      "insertBefore": "elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85)",
+      "block": "blocks/cmake-board-branch.txt",
+      "required": true
+    },
+    {
+      "file": "main/CMakeLists.txt",
+      "id": "cmake-sources-includes",
+      "description": "ESP-NOW 源码路径 / include / esp_wifi 依赖（追加块 2/2）",
+      "startMarker": "AtzGauge 追加块 2/2：ESP-NOW",
+      "insertBefore": "idf_component_register(SRCS ${SOURCES}",
+      "block": "blocks/cmake-sources-includes.txt",
+      "required": true
+    },
+    {
+      "file": "main/Kconfig.projbuild",
+      "id": "kconfig-board",
+      "description": "AtzGauge 板型 Kconfig 条目",
+      "startMarker": "config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85_ATZGAUGE",
+      "insertBefore": "config BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_49",
+      "block": "blocks/kconfig-board.txt",
+      "required": true
+    }
+  ],
+  "checks": [
+    {
+      "file": "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/config.json",
+      "contains": "esp32-s3-touch-lcd-1.85-atzgauge"
+    },
+    {
+      "file": "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/esp32-s3-touch-lcd-1.85-atzgauge.cc",
+      "contains": "DECLARE_BOARD(AtzGaugeBoard)"
+    },
+    {
+      "file": "main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_ui.cc",
+      "contains": "atz_ui_register_themes"
+    },
+    {
+      "file": "main/espnow_slave/espnow_link.c",
+      "contains": "espnow_slave_start"
+    }
+  ]
+}
