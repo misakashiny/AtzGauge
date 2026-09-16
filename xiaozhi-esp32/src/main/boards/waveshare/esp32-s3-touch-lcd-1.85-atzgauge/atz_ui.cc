@@ -1027,6 +1027,21 @@ void atz_ui_register_tools(AtzLcdDisplay* display) {
         });
 #endif  // ATZ_UI_ENABLE
 
+    // 转速环开关：用户说"把转速环关掉/打开"就调它（写 NVS，重启仍生效）
+    mcp_server.AddTool(
+        "self.ui.set_rpm_ring",
+        "Show or hide the RPM ring drawn along the edge of the screen (the ring that fills up "
+        "with engine RPM). Call this when the user says \"把转速环关掉\", \"不要那个圈\", "
+        "\"关掉转速环\", \"hide the rpm ring\", \"把转速环打开\", \"show the rpm ring\". "
+        "The choice is stored on the device and survives a reboot.",
+        PropertyList({Property("enabled", kPropertyTypeBoolean, true)}),
+        [](const PropertyList& properties) -> ReturnValue {
+            const bool on = properties["enabled"].value<bool>();
+            atz_rpm_ring_set_enabled(on);
+            atz_rpm_ring_save_enabled(on);      // 写 NVS：重启后仍生效
+            return std::string(on ? "rpm ring is now ON" : "rpm ring is now OFF");
+        });
+
     // 顶栏图标（WiFi / 电量）：圆屏顶栏很窄，默认不显示 WiFi 图标。
     // 单独做成工具，是为了用户哪天想看网络状态时不用重新刷固件。
     mcp_server.AddTool(

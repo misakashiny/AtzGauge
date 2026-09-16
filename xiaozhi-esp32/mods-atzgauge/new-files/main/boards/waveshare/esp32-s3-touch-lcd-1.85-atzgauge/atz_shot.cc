@@ -4,6 +4,7 @@
 #include "atz_ui_config.h"
 
 #include "display.h"
+#include "espnow_link.h"
 #include "atz_car_page.h"
 #include "atz_rpm_ring.h"
 #include "atz_touch.h"
@@ -37,6 +38,8 @@ esp_err_t SizeHandler(httpd_req_t* req);
 esp_err_t PerfHandler(httpd_req_t* req);
 esp_err_t LayoutHandler(httpd_req_t* req);
 esp_err_t SubtitleHandler(httpd_req_t* req);
+esp_err_t InjectHandler(httpd_req_t* req);
+esp_err_t RingHandler(httpd_req_t* req);
 
 // 递归 dump 控件树（/layout 用）。class 用指针比对，避免依赖 LVGL 内部类的字段。
 void DumpObjTree(lv_obj_t* obj, int depth, char* out, size_t len, size_t* used) {
@@ -214,7 +217,7 @@ void StartTask(void* arg) {
             // ★ 必须 ≥ 实际注册的端点个数：httpd_register_uri_handler 超限时只返回
             //   ESP_ERR_HTTPD_HANDLERS_FULL，**不会**报错也不会崩，表现为该 URL 直接 404。
             //   （踩过一次：设 4 而注册了 5 个 → /touch 一直 404。）
-            config.max_uri_handlers = 12;
+            config.max_uri_handlers = 14;
 
             if (httpd_start(&g_server, &config) != ESP_OK) {
                 ESP_LOGE(TAG, "failed to start snapshot server on port %d",
@@ -278,6 +281,18 @@ void StartTask(void* arg) {
                 .handler = LayoutHandler,
                 .user_ctx = nullptr,
             };
+            httpd_uri_t ring_uri = {
+                .uri = "/ring",
+                .method = HTTP_GET,
+                .handler = RingHandler,
+                .user_ctx = nullptr,
+            };
+            httpd_uri_t inject_uri = {
+                .uri = "/inject",
+                .method = HTTP_GET,
+                .handler = InjectHandler,
+                .user_ctx = nullptr,
+            };
             httpd_uri_t subtitle_uri = {
                 .uri = "/subtitle",
                 .method = HTTP_GET,
@@ -302,6 +317,12 @@ void StartTask(void* arg) {
             }
             if (httpd_register_uri_handler(g_server, &layout_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/layout registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &ring_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/ring registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &inject_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/inject registration failed (max_uri_handlers too small?)");
             }
             if (httpd_register_uri_handler(g_server, &subtitle_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/subtitle registration failed (max_uri_handlers too small?)");
@@ -468,6 +489,75 @@ esp_err_t SubtitleHandler(httpd_req_t* req) {
     return httpd_resp_send(req, "ok: subtitle cleared", HTTPD_RESP_USE_STRLEN);
 }
 
+// ★ PC 端模拟器用的数据入口：把一条"合成车况"注入车况缓存 —— 走的链路与真主表完全一样
+//   （espnow_slave_inject_test_packet → obd_data_cache → 转速环/车况条/车况页/告警）。
+//   http://<设备IP>:8099/inject?rpm=3200&speed=88&coolant=92&oil=100&intake=38&load=42&tps=27&volt=14.2
+//   · 只传想改的字段也行，缺省字段沿用上一次的值（首次用一组合理缺省）
+//   · 全部可省略；volt 单位是 V（内部换算成 mV）
+//   · http://<设备IP>:8099/inject?stop=1   停止注入（2 秒后数据变"陈旧"，环归零变暗）
+//   安全提示：rpm ≥ 6500 会真的触发本地高转告警（会出声），这是设计行为。
+esp_err_t InjectHandler(httpd_req_t* req) {
+    static uint16_t s_rpm = 0;
+    static uint8_t s_speed = 0;
+    static int16_t s_coolant = 85, s_oil = 95, s_intake = 30, s_load = 20, s_tps = 10;
+    static int32_t s_bat_mv = 14200;
+
+    char query[256] = {};
+    char value[32] = {};
+    const bool has = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
+
+    auto getInt = [&](const char* key, int fallback) -> int {
+        if (!has) return fallback;
+        if (httpd_query_key_value(query, key, value, sizeof(value)) != ESP_OK) return fallback;
+        return atoi(value);
+    };
+
+    if (getInt("stop", 0) != 0) {
+        atz_ui_car_inject_stop();
+        return httpd_resp_send(req, "ok: injection stopped (data goes stale in ~2 s)\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    s_rpm = (uint16_t)getInt("rpm", s_rpm);
+    s_speed = (uint8_t)getInt("speed", s_speed);
+    s_coolant = (int16_t)getInt("coolant", s_coolant);
+    s_oil = (int16_t)getInt("oil", s_oil);
+    s_intake = (int16_t)getInt("intake", s_intake);
+    s_load = (int16_t)getInt("load", s_load);
+    s_tps = (int16_t)getInt("tps", s_tps);
+    // 电压用"伏"传进来（14.2），内部按 mV 存
+    if (has && httpd_query_key_value(query, "volt", value, sizeof(value)) == ESP_OK) {
+        s_bat_mv = (int32_t)(atof(value) * 1000.0f + 0.5f);
+    }
+
+    espnow_slave_inject_test_packet(s_rpm, s_speed, s_coolant, s_oil, s_intake, s_load, s_tps,
+                                    s_bat_mv);
+
+    char body[192];
+    snprintf(body, sizeof(body),
+             "ok: rpm=%u speed=%u coolant=%d oil=%d intake=%d load=%d tps=%d batt=%.2fV\n",
+             (unsigned)s_rpm, (unsigned)s_speed, (int)s_coolant, (int)s_oil, (int)s_intake,
+             (int)s_load, (int)s_tps, s_bat_mv / 1000.0);
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+// 台架用：转速环开关（等价于语音 self.ui.set_rpm_ring）
+//   http://<设备IP>:8099/ring            查询
+//   http://<设备IP>:8099/ring?enabled=0  关掉（写 NVS，重启仍生效）
+esp_err_t RingHandler(httpd_req_t* req) {
+    char query[48] = {};
+    char value[16] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "enabled", value, sizeof(value)) == ESP_OK) {
+        const bool on = atoi(value) != 0;
+        atz_rpm_ring_set_enabled(on);
+        atz_rpm_ring_save_enabled(on);          // 写 NVS：重启后仍生效
+    }
+    char body[96];
+    snprintf(body, sizeof(body), "ring enabled=%d visible=%d\n", (int)atz_rpm_ring_enabled(),
+             (int)atz_rpm_ring_visible());
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
 // 台架用：量 UI 的真实流畅度 —— 直接读 LVGL 每帧的渲染事件，而不是"看着挺顺"。
 //   http://<设备IP>:8099/perf?seconds=5
 // 输出：帧率、平均每帧"渲染+刷屏"耗时、环定时器实际调用次数与真正触发重绘的次数。

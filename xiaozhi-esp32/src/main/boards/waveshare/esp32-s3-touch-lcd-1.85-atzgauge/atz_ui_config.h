@@ -170,6 +170,7 @@
 #define ATZ_UI_NVS_KEY_ICON_WIFI    "icon_wifi"      // 顶栏 WiFi 图标是否显示（0/1）
 #define ATZ_UI_NVS_KEY_ICON_BATTERY "icon_batt"      // 顶栏电量图标是否显示（0/1）
 #define ATZ_UI_NVS_KEY_PAGE_FIELDS  "page_fields"    // 「车况」页显示哪些项目（逗号分隔的 token）
+#define ATZ_UI_NVS_KEY_RPM_RING     "rpm_ring"       // 转速环开关（0/1，语音可改）
 // 一次性迁移标记：老设备 NVS 里存的是上游默认的 "light"（白底）。
 // 第一次跑本 UI 代码时把主题改成 ATZ_UI_DEFAULT_THEME 并置位此标记；
 // 之后用户自己切过的主题一律尊重，不再覆盖。
@@ -220,13 +221,27 @@
 #define ATZ_RPM_RING_MAX_RPM        8000   // 环走满一圈对应的转速
 #define ATZ_RPM_RING_WARN_RPM       5500   // 到这里的弧变琥珀色
 #define ATZ_RPM_RING_ALARM_RPM      6500   // 到这里的弧变红色（与 car_alarm 阈值一致）
+
+// ── 外观（2026-09-16 美化）──────────────────────────────────────────────────
+#define ATZ_RPM_RING_ROUNDED        1      // 弧线两端**圆头**：更像真表，观感柔和很多
+#define ATZ_RPM_RING_BASE_COLOR     0      // 指示弧基色；0 = 跟随主题文字色（深色主题=白、浅色主题=近黑）
+                                           //   想固定就写 0xRRGGBB：浅底建议 0x0A84FF（蓝），深底建议 0xFFFFFF
+#define ATZ_RPM_RING_WARN_COLOR     0xFFA000   // 接近上限：琥珀
+#define ATZ_RPM_RING_ALARM_COLOR    0xFF3B30   // 超限：红（与告警/车况页同色）
+// 红区刻度：在环**内侧**再画一条细弧标出"红线区"（ALARM_RPM → 满圈）。
+// 为什么放内侧：指示弧占半径 154~190，标在 148~152 不会被它盖住；而且它是**静态**的
+// （只在首帧与"指示弧恰好扫过它"时重绘），几乎不占帧预算。
+#define ATZ_RPM_RING_REDZONE        1      // 0 = 不画红区刻度
+#define ATZ_RPM_RING_REDZONE_W      4      // 红区刻度线宽（px）
+#define ATZ_RPM_RING_REDZONE_GAP    3      // 与环内缘的间距（px）
+#define ATZ_RPM_RING_REDZONE_OPA    200    // 红区刻度不透明度 0~255
 // 取数节奏：主表就是 10Hz
 #define ATZ_RPM_RING_DATA_MS        100    // 从车况缓存取新目标值的周期（ms）
 #define ATZ_RPM_RING_STEP           20     // 死区（rpm）：目标变化小于这个值就不换目标
 // ★ 流畅度：**不用 lv_anim**。LVGL 的动画定时器周期由编译期的 LV_DEF_REFR_PERIOD 决定
 //   （本项目 = 33ms），动画最多 ~30fps 就到顶了 —— 实测 27~28fps 正是撞在这个天花板上。
 //   改成我们自己按 16ms 步进做插值（每步走剩余差的 1/3），就能跑到 ~60fps。
-#define ATZ_RPM_RING_TICK_MS        8      // 插值步进周期（8ms ≈ 125fps 上限）
+#define ATZ_RPM_RING_TICK_MS        6      // 插值步进周期（6ms ≈ 166fps 上限；实测 ~90fps，见 21 号文档 5.5）
 #define ATZ_RPM_RING_PUSH_STEP      4      // 显示值变化不到这个数就不写控件（4rpm ≈ 0.18°，看不出来）
 // ★ 语音优先：设备**不在空闲状态**时（连接/聆听/说话），环的插值按这个分母降频。
 //   跑 12ms 全速时 LVGL 约占 25% CPU + 大量总线带宽，对话时降载能明显减少音频卡顿。

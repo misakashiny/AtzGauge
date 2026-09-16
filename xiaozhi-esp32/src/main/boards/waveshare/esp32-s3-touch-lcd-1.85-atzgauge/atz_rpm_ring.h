@@ -21,6 +21,15 @@ void atz_rpm_ring_init(Display* display);
 void atz_rpm_ring_set_visible(bool visible);
 bool atz_rpm_ring_visible(void);
 
+/**
+ * 转速环总开关（**语音可控**）：写 NVS，重启后仍生效。
+ * 关闭时环与红区刻度一起隐藏，插值也停掉（不占 CPU）。
+ */
+void atz_rpm_ring_set_enabled(bool on);
+bool atz_rpm_ring_enabled(void);
+/** 把开关写进 NVS（语音工具 / /ring 端点用；set_enabled 本身只改内存与显示）。 */
+void atz_rpm_ring_save_enabled(bool on);
+
 /** 跟随主题换色（fg_rgb = 圈与弧的基色，传 0xRRGGBB；底槽用同色低不透明度，深浅主题都好看）。 */
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb);
 

@@ -19,6 +19,7 @@
 #include "display.h"
 #include "espnow_link.h"
 #include "obd_data_cache.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -39,9 +40,11 @@
 namespace {
 
 Display* g_display = nullptr;
-lv_obj_t* g_arc = nullptr;
+lv_obj_t* g_arc = nullptr;          // 主环（底槽 + 指示弧）
+lv_obj_t* g_redzone = nullptr;      // 红区刻度（静态细弧，环内侧）
 lv_timer_t* g_timer = nullptr;
-bool g_visible = true;
+bool g_visible = true;              // 当前是否显示（打开车况页时临时隐藏）
+bool g_enabled = true;              // 用户开关（NVS 持久化，语音可控）
 uint32_t g_fg = 0xFFFFFF;        // 默认按深色主题（黑底白环）
 int g_last_zone = -1;
 bool g_last_stale = false;
@@ -64,8 +67,17 @@ volatile uint32_t g_inv_px_last = 0;        // 上一帧重绘像素
 volatile uint32_t g_inv_px_max = 0;         // 单帧最多重绘像素
 int64_t g_render_start_us = 0;
 
-constexpr uint32_t kColorWarn = 0xFFA000;   // 琥珀
-constexpr uint32_t kColorAlarm = 0xFF3B30;  // 红（与 car_alarm / 车况页一致）
+constexpr uint32_t kColorWarn = ATZ_RPM_RING_WARN_COLOR;    // 琥珀（接近上限）
+constexpr uint32_t kColorAlarm = ATZ_RPM_RING_ALARM_COLOR;  // 红（超限；与 car_alarm / 车况页同色）
+
+/** 指示弧基色：ATZ_RPM_RING_BASE_COLOR 非 0 时用固定色，否则跟随主题文字色。 */
+inline uint32_t BaseColor(void) {
+#if ATZ_RPM_RING_BASE_COLOR != 0
+    return ATZ_RPM_RING_BASE_COLOR;
+#else
+    return g_fg;
+#endif
+}
 
 uint32_t ZoneColor(int rpm) {
     if (rpm >= ATZ_RPM_RING_ALARM_RPM) {
@@ -74,7 +86,7 @@ uint32_t ZoneColor(int rpm) {
     if (rpm >= ATZ_RPM_RING_WARN_RPM) {
         return kColorWarn;
     }
-    return g_fg;
+    return BaseColor();
 }
 
 int ZoneIndex(int rpm) {
@@ -91,12 +103,12 @@ void StyleArc(void) {
     lv_obj_set_style_arc_color(g_arc, lv_color_hex(g_fg), LV_PART_MAIN);
     lv_obj_set_style_arc_opa(g_arc, (lv_opa_t)ATZ_RPM_RING_TRACK_OPA, LV_PART_MAIN);
     lv_obj_set_style_arc_width(g_arc, ATZ_RPM_RING_W, LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(g_arc, false, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(g_arc, ATZ_RPM_RING_ROUNDED != 0, LV_PART_MAIN);
     // 指示弧：跟转速走的那一段
     lv_obj_set_style_arc_color(g_arc, lv_color_hex(ZoneColor(0)), LV_PART_INDICATOR);
     lv_obj_set_style_arc_opa(g_arc, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_arc_width(g_arc, ATZ_RPM_RING_W, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(g_arc, false, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(g_arc, ATZ_RPM_RING_ROUNDED != 0, LV_PART_INDICATOR);
     // 不要旋钮
     lv_obj_set_style_bg_opa(g_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_pad_all(g_arc, 0, LV_PART_KNOB);
@@ -117,7 +129,7 @@ void RingTimerCb(lv_timer_t* timer) {
     // 跑在 LVGL 任务里（锁已经由 lvgl_port 持有），这里不能再取锁
     (void)timer;
     g_ring_calls = g_ring_calls + 1;
-    if (g_arc == nullptr || !g_visible) {
+    if (g_arc == nullptr || !g_visible || !g_enabled) {
         return;
     }
 
@@ -275,7 +287,37 @@ void atz_rpm_ring_init(Display* display) {
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
-    // 画在最前面：上游的 container_ 是不透明底，藏在它后面就看不见了
+#if ATZ_RPM_RING_REDZONE
+    // ── 红区刻度：环**内侧**一条静态细弧（标出红线区）──────────────────────
+    // 半径 = 环内缘 − 间距 − 线宽/2；角度用与主环同一套约定（bg_angles 从 0 开始增长）。
+    {
+        const int ring_inner = ATZ_RPM_RING_D / 2 - ATZ_RPM_RING_W;      // 154
+        const int rz_radius = ring_inner - ATZ_RPM_RING_REDZONE_GAP - ATZ_RPM_RING_REDZONE_W / 2;
+        const int start_deg =
+            (int)((int64_t)ATZ_RPM_RING_ALARM_RPM * 360 / ATZ_RPM_RING_MAX_RPM + 0.5);
+        g_redzone = lv_arc_create(screen);
+        lv_obj_set_size(g_redzone, rz_radius * 2, rz_radius * 2);
+        lv_obj_align(g_redzone, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(g_redzone, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(g_redzone, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_FLOATING);   // 同主环：别撑出屏幕滚动条
+        lv_arc_set_rotation(g_redzone, 90);
+        lv_arc_set_bg_angles(g_redzone, start_deg, 360);
+        lv_arc_set_range(g_redzone, 0, 100);
+        lv_arc_set_value(g_redzone, 0);                     // 只要底槽那段，不要指示弧
+        lv_obj_set_style_arc_color(g_redzone, lv_color_hex(kColorAlarm), LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(g_redzone, (lv_opa_t)ATZ_RPM_RING_REDZONE_OPA, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(g_redzone, ATZ_RPM_RING_REDZONE_W, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(g_redzone, true, LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(g_redzone, LV_OPA_TRANSP, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(g_redzone, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(g_redzone, 0, LV_PART_KNOB);
+        lv_obj_set_style_border_width(g_redzone, 0, LV_PART_KNOB);
+        lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);     // 先藏，等确认开关状态
+    }
+#endif
+
+    // 画在最前面：上游的 container_ 是不透明底，藏在它后面就看不见了（红区在主环之下）
     lv_obj_move_foreground(g_arc);
 
     g_timer = lv_timer_create(RingTimerCb, ATZ_RPM_RING_TICK_MS, nullptr);
@@ -285,12 +327,55 @@ void atz_rpm_ring_init(Display* display) {
     g_pushed_value = 0;
     lv_arc_set_value(g_arc, 0);
 
-    ESP_LOGI(TAG, "rpm ring ready: ONE ring d=%d w=%d (outer edge r=%d = screen edge), "
-                  "full scale=%d rpm (warn %d / alarm %d), data %d ms, interpolate %d ms, "
-                  "push step %d rpm",
+    // 用户的开关状态（语音改过就写 NVS）：默认 = 编译期 ATZ_RPM_RING_ENABLE
+    g_enabled = Settings(ATZ_UI_NVS_NAMESPACE, true).GetInt(ATZ_UI_NVS_KEY_RPM_RING, 1) != 0;
+    atz_rpm_ring_set_enabled(g_enabled);
+
+    ESP_LOGI(TAG, "rpm ring ready: d=%d w=%d (outer r=%d = screen edge), full scale=%d rpm "
+                  "(warn %d / alarm %d), data %d ms, tick %d ms, push step %d rpm, "
+                  "rounded=%d redzone=%d enabled=%d",
              ATZ_RPM_RING_D, ATZ_RPM_RING_W, ATZ_RPM_RING_D / 2, ATZ_RPM_RING_MAX_RPM,
              ATZ_RPM_RING_WARN_RPM, ATZ_RPM_RING_ALARM_RPM, ATZ_RPM_RING_DATA_MS,
-             ATZ_RPM_RING_TICK_MS, ATZ_RPM_RING_PUSH_STEP);
+             ATZ_RPM_RING_TICK_MS, ATZ_RPM_RING_PUSH_STEP, ATZ_RPM_RING_ROUNDED,
+             ATZ_RPM_RING_REDZONE, (int)g_enabled);
+}
+
+// 语音开关（写 NVS，重启仍生效）。关闭时把环和红区刻度一起藏掉，并停掉插值。
+void atz_rpm_ring_set_enabled(bool on) {
+    g_enabled = on;
+    if (g_display == nullptr || g_arc == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(g_display);
+    const bool show = on && g_visible;
+    if (show) {
+        lv_obj_remove_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_arc);
+#if ATZ_RPM_RING_REDZONE
+        if (g_redzone != nullptr) {
+            lv_obj_remove_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+        }
+#endif
+        RingTimerCb(nullptr);   // 立刻补一帧
+    } else {
+        lv_obj_add_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_REDZONE
+        if (g_redzone != nullptr) {
+            lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+        }
+#endif
+    }
+    ESP_LOGI(TAG, "rpm ring %s", on ? "ON" : "OFF");
+}
+
+/** 把当前开关写进 NVS（语音工具与 /ring 端点都调它）。 */
+void atz_rpm_ring_save_enabled(bool on) {
+    Settings(ATZ_UI_NVS_NAMESPACE, true).SetInt(ATZ_UI_NVS_KEY_RPM_RING, on ? 1 : 0);
+    ESP_LOGI(TAG, "rpm ring switch saved to NVS: %d", on ? 1 : 0);
+}
+
+bool atz_rpm_ring_enabled(void) {
+    return g_enabled;
 }
 
 void atz_rpm_ring_set_visible(bool visible) {
@@ -299,12 +384,22 @@ void atz_rpm_ring_set_visible(bool visible) {
     }
     DisplayLockGuard lock(g_display);
     g_visible = visible;
-    if (visible) {
+    if (visible && g_enabled) {
         lv_obj_remove_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_arc);
+#if ATZ_RPM_RING_REDZONE
+        if (g_redzone != nullptr) {
+            lv_obj_remove_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+        }
+#endif
         RingTimerCb(nullptr);              // 立刻补一帧，别显示旧值
     } else {
         lv_obj_add_flag(g_arc, LV_OBJ_FLAG_HIDDEN);
+#if ATZ_RPM_RING_REDZONE
+        if (g_redzone != nullptr) {
+            lv_obj_add_flag(g_redzone, LV_OBJ_FLAG_HIDDEN);
+        }
+#endif
     }
 }
 
@@ -372,6 +467,9 @@ void atz_rpm_ring_perf_ext(uint64_t* worst_us, uint64_t* inv_px, uint32_t* inv_m
 void atz_rpm_ring_init(Display* display) { (void)display; }
 void atz_rpm_ring_set_visible(bool visible) { (void)visible; }
 bool atz_rpm_ring_visible(void) { return false; }
+void atz_rpm_ring_set_enabled(bool on) { (void)on; }
+bool atz_rpm_ring_enabled(void) { return false; }
+void atz_rpm_ring_save_enabled(bool on) { (void)on; }
 void atz_rpm_ring_apply_theme(uint32_t fg_rgb) { (void)fg_rgb; }
 void atz_rpm_ring_refresh(void) {}
 void atz_rpm_ring_perf(char* buf, size_t len, uint32_t frames, uint64_t busy_us, uint32_t calls,
