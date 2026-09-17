@@ -21,6 +21,8 @@ const GIT = 'D:/esp/mingit/cmd/git.exe';
 const IGNORE = [
   /^build\//, /^managed_components\//, /^sdkconfig/, /^dependencies\.lock$/,
   /^main\/assets\/lang_config\.h$/, /^scripts\/__pycache__\//, /\.pyc$/,
+  // ★ 本机私密覆盖头（含调试口令）：绝不能进套件，否则会经套件泄回仓库
+  /^main\/boards\/.*\/atz_local\.h$/,
 ];
 
 function walk(root, rel = '') {

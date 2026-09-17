@@ -10,28 +10,36 @@
 //   * 10Hz 实时流跑在浏览器里（关掉页面就停，不会偷偷发包）
 //
 // 用法：
-//   node tools/sim-console.mjs                 # 默认连 192.168.5.129，界面 http://127.0.0.1:8123
-//   node tools/sim-console.mjs --device 192.168.5.130 --port 8123
+//   node tools/sim-console.mjs                 # 界面 http://127.0.0.1:8123，连默认 IP
+//   node tools/sim-console.mjs --device <设备IP> --port 8123
+//   设备 IP 也可以用环境变量 ATZ_DEVICE 给（默认 192.168.1.100 只是占位）
 //   或双击 tools\sim-console.cmd
 import http from 'node:http';
 import { exec } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const argv = process.argv.slice(2);
 function arg(name, dflt) {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
 }
-const DEVICE = arg('device', '192.168.5.129');
-// 调试端点鉴权 token：直接读板型配置头，免得手工同步（读不到就用默认值）
+const DEVICE = arg('device', process.env.ATZ_DEVICE || '192.168.1.100');
+// 调试端点鉴权 token：读板目录下的私密头 atz_local.h，其次 atz_ui_config.h
+// （读不到就用占位值；也可以直接 --key=xxx 或设 ATZ_DEBUG_TOKEN 环境变量）
 function readDebugToken() {
-  const p = 'D:\\\\AtzGauge\\\\xiaozhi-esp32\\\\src\\\\main\\\\boards\\\\waveshare\\\\esp32-s3-touch-lcd-1.85-atzgauge\\\\atz_ui_config.h';
-  try {
-    const txt = readFileSync(p, 'utf8');
-    const m = txt.match(/#define\s+ATZ_DEBUG_TOKEN\s+"([^"]*)"/);
-    if (m && m[1]) return m[1];
-  } catch { /* 源码不在本机就退回默认 */ }
-  return 'atz-2026';
+  if (process.env.ATZ_DEBUG_TOKEN) return process.env.ATZ_DEBUG_TOKEN;
+  const board = join(dirname(fileURLToPath(import.meta.url)), '..', 'xiaozhi-esp32', 'src', 'main',
+    'boards', 'waveshare', 'esp32-s3-touch-lcd-1.85-atzgauge');
+  for (const f of ['atz_local.h', 'atz_ui_config.h']) {
+    try {
+      const txt = readFileSync(join(board, f), 'utf8');
+      const m = txt.match(/#define\s+ATZ_DEBUG_TOKEN\s+"([^"]*)"/);
+      if (m && m[1]) return m[1];
+    } catch { /* 文件不存在就继续找 */ }
+  }
+  return 'atz-local-debug';
 }
 const KEY = arg('key', readDebugToken());
 const PORT = Number(arg('port', '8123'));

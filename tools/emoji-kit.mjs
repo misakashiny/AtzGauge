@@ -48,7 +48,7 @@ const BOARD = path.join(REPO, 'xiaozhi-esp32/src/main/boards/waveshare/esp32-s3-
 const BUILTIN_DIR = path.join(REPO, 'xiaozhi-esp32/src/managed_components/78__xiaozhi-fonts/png/noto-color-emoji_128');
 const OUT_DIR = path.join(REPO, 'backup/emoji-kit');          // 产物落这里（不进 git）
 const PORT = Number(arg('port', '8124'));
-const DEVICE = String(arg('device', '192.168.5.129'));
+const DEVICE = String(arg('device', process.env.ATZ_DEVICE || '192.168.1.100'));
 const KEY = readDebugToken();
 
 // 素材规格（与固件显示一致：128 素材 × 125% 缩放 → 屏上 160px）
@@ -57,12 +57,18 @@ const SIZE_MIN = 96;
 const SIZE_MAX = 512;
 const MAX_ASSETS = Number(arg('max-assets', String(8 * 1024 * 1024)));   // assets 分区 8MB
 
+// 调试 token：优先读板目录下的私密头 atz_local.h（不进仓库），
+// 没有就退回 atz_ui_config.h 里的占位值。环境变量 ATZ_DEBUG_TOKEN 优先级最高。
 function readDebugToken() {
-  try {
-    const h = fs.readFileSync(path.join(BOARD, 'atz_ui_config.h'), 'utf8');
-    const m = h.match(/ATZ_DEBUG_TOKEN\s+"([^"]+)"/);
-    return m ? m[1] : 'atz-2026';
-  } catch { return 'atz-2026'; }
+  if (process.env.ATZ_DEBUG_TOKEN) return process.env.ATZ_DEBUG_TOKEN;
+  for (const f of ['atz_local.h', 'atz_ui_config.h']) {
+    try {
+      const h = fs.readFileSync(path.join(BOARD, f), 'utf8');
+      const m = h.match(/ATZ_DEBUG_TOKEN\s+"([^"]+)"/);
+      if (m && m[1]) return m[1];
+    } catch { /* 文件不存在就继续找 */ }
+  }
+  return 'atz-local-debug';
 }
 
 function die(msg) { console.error(`\n✗ ${msg}\n`); process.exit(1); }

@@ -1,9 +1,10 @@
 // 量测脚本：把 /size 设成不同值，各截一张图，量出「表情」「顶部时间」的真实像素尺寸
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const IP = '192.168.5.129';
-const OUT = 'D:/AtzGauge/backup';
+const IP = process.env.ATZ_DEVICE || '192.168.1.100';
+const OUT = fileURLToPath(new URL('../backup/', import.meta.url));
 const PS = 'powershell';
 
 function fetchTo(url, file) {

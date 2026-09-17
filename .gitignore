@@ -14,6 +14,8 @@
 
 /*
 !/.gitignore
+!/README.md
+!/LICENSE
 !/开发参考/
 !/tools/
 
@@ -44,3 +46,9 @@ backup/
 *.map
 sdkconfig
 sdkconfig.old
+
+# ── 本机私密值（不要进仓库）──────────────────────────────────────
+# atz_local.h：板目录下的本地覆盖头，放 ATZ_DEBUG_TOKEN 等口令。
+# 上游 xiaozhi-esp32\.gitignore 也有同名规则，这里再写一遍是为了本仓库独立成立。
+atz_local.h
+**/atz_local.h

@@ -598,7 +598,7 @@ esp_err_t TapHandler(httpd_req_t* req) {
 }
 
 // 台架用：**换表情包/素材**（两条路，等价于语音工具 self.assets.set_download_url）
-//   http://<IP>:8099/assets?url=http://192.168.5.128:8124/assets.bin&key=…&reboot=1
+//   http://<设备IP>:8099/assets?url=http://<PC的IP>:8124/assets.bin&key=…&reboot=1
 //     → 写 NVS(assets/download_url) 并（可选）重启；设备**开机时**会去下载并 apply。
 //       这是上游支持的运行时换素材机制，不用重刷固件。配套工具：tools\emoji-kit.mjs
 //   http://<IP>:8099/assets                                              → 只读：当前地址 + 上次进度
