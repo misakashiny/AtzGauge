@@ -14,6 +14,7 @@
 #include "atz_ui.h"
 #include "jpg/image_to_jpeg.h"
 #include "lvgl_theme.h"
+#include "settings.h"
 
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -38,6 +39,7 @@ esp_err_t CarBarHandler(httpd_req_t* req);
 esp_err_t TouchHandler(httpd_req_t* req);
 esp_err_t TapHandler(httpd_req_t* req);
 esp_err_t SwipeHandler(httpd_req_t* req);
+esp_err_t AssetsHandler(httpd_req_t* req);
 esp_err_t CarPageHandler(httpd_req_t* req);
 esp_err_t SizeHandler(httpd_req_t* req);
 esp_err_t PerfHandler(httpd_req_t* req);
@@ -426,6 +428,12 @@ void StartTask(void* arg) {
                 .handler = SwipeHandler,
                 .user_ctx = nullptr,
             };
+            httpd_uri_t assets_uri = {
+                .uri = "/assets",
+                .method = HTTP_GET,
+                .handler = AssetsHandler,
+                .user_ctx = nullptr,
+            };
             httpd_register_uri_handler(g_server, &shot_uri);
             httpd_register_uri_handler(g_server, &health_uri);
             httpd_register_uri_handler(g_server, &theme_uri);
@@ -462,6 +470,9 @@ void StartTask(void* arg) {
             }
             if (httpd_register_uri_handler(g_server, &swipe_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/swipe registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &assets_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/assets registration failed (max_uri_handlers too small?)");
             }
 
             ESP_LOGI(TAG, "screen snapshot ready: http://" IPSTR ":%d/shot.jpg", IP2STR(&ip.ip),
@@ -583,6 +594,89 @@ esp_err_t TapHandler(httpd_req_t* req) {
         ESP_LOGI(TAG, "/tap (%d,%d) -> no zone hit", x, y);
     }
     snprintf(body, sizeof(body), "tap (%d,%d) -> zone=%d [%s]\n", x, y, id, name);
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+// 台架用：**换表情包/素材**（两条路，等价于语音工具 self.assets.set_download_url）
+//   http://<IP>:8099/assets?url=http://192.168.5.128:8124/assets.bin&key=…&reboot=1
+//     → 写 NVS(assets/download_url) 并（可选）重启；设备**开机时**会去下载并 apply。
+//       这是上游支持的运行时换素材机制，不用重刷固件。配套工具：tools\emoji-kit.mjs
+//   http://<IP>:8099/assets                                              → 只读：当前地址 + 上次进度
+//   http://<IP>:8099/assets?clear=1&key=…                                → 清掉待下载地址（取消）
+//   http://<IP>:8099/assets?progress=42&key=…                            → 由 PC 端工具上报进度（显示在字幕上）
+// 为什么要这个端点（而不是直接调 MCP）：本板固件里 MCP 工具只走云端 WebSocket，
+// 没有 HTTP 侧的调用入口 —— 而"换素材"必须能在**没有云连接**的台架上跑通。
+esp_err_t AssetsHandler(httpd_req_t* req) {
+    char query[256] = {};
+    char value[192] = {};
+    const bool has_query = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK;
+    const bool want_url = has_query &&
+                          httpd_query_key_value(query, "url", value, sizeof(value)) == ESP_OK;
+    char prog_buf[16] = {};
+    const bool want_prog = has_query &&
+                           httpd_query_key_value(query, "progress", prog_buf, sizeof(prog_buf)) == ESP_OK;
+    const bool want_clear = has_query &&
+                            httpd_query_key_value(query, "clear", value, sizeof(value)) == ESP_OK;
+
+    if (want_url || want_clear || want_prog) {
+        if (!WriteAllowed(req)) {
+            return DenyWrite(req);
+        }
+    }
+
+    if (want_clear) {
+        Settings("assets", true).EraseKey("download_url");
+        char body[96];
+        snprintf(body, sizeof(body), "pending assets url cleared\n");
+        return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (want_prog) {
+        // 进度只显示在字幕上（不写 NVS）：PC 工具边收边报，用户能看见百分比
+        char msg[32];
+        snprintf(msg, sizeof(msg), "素材 %d%%", atoi(prog_buf));
+        if (g_display != nullptr) {
+            g_display->SetChatMessage("system", msg);
+        }
+        return httpd_resp_send(req, "ok\n", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (want_url) {
+        if (strncmp(value, "http://", 7) != 0 && strncmp(value, "https://", 8) != 0) {
+            char body[128];
+            snprintf(body, sizeof(body), "denied: url must start with http:// or https://\n");
+            return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+        }
+        Settings("assets", true).SetString("download_url", value);
+        ESP_LOGI(TAG, "/assets: pending download url set to %s", value);
+        char do_reboot[8] = {};
+        const bool reboot = has_query &&
+                            httpd_query_key_value(query, "reboot", do_reboot, sizeof(do_reboot)) == ESP_OK &&
+                            atoi(do_reboot) != 0;
+        char body[384];
+        snprintf(body, sizeof(body),
+                 "ok: assets download url saved\n  %s\n  %s\n",
+                 value,
+                 reboot ? "rebooting now (download happens at boot)" :
+                          "takes effect on the NEXT BOOT (send reboot=1 or power-cycle)");
+        httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+        if (reboot) {
+            vTaskDelay(pdMS_TO_TICKS(600));   // 让响应先发出去
+            esp_restart();
+        }
+        return ESP_OK;
+    }
+
+    // 只读查询
+    Settings s("assets", false);
+    std::string pending = s.GetString("download_url", "");
+    char body[320];
+    snprintf(body, sizeof(body),
+             "pending download url: %s\n"
+             "note: the device downloads it at BOOT, then wipes the setting\n"
+             "push:  /assets?url=http://<PC>:8124/assets.bin&reboot=1&key=...\n"
+             "clear: /assets?clear=1&key=...\n",
+             pending.empty() ? "(none - using built-in assets)" : pending.c_str());
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 
