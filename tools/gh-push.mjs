@@ -216,8 +216,22 @@ try {
 }
 
 if (push.status === 0) {
-  console.log(`\n✓ 推送完成：https://github.com/${USER}/${REPO}\n`);
-  process.exit(0);
+  // 推完核对一次：远端 head 必须等于本地 head（防止"以为推上去了"）
+  const local = git(['rev-parse', BRANCH]).trim();
+  let remote = '';
+  try {
+    remote = (git(['ls-remote', REMOTE, `refs/heads/${BRANCH}`]).trim().split(/\s+/)[0]) || '';
+  } catch (e) {
+    remote = `<查询失败: ${String(e.message).slice(0, 60)}>`;
+  }
+  console.log(`\n  本地  ${local}`);
+  console.log(`  远端  ${remote}`);
+  if (local && local === remote) {
+    console.log(`\n✓ 推送完成并已核对：https://github.com/${USER}/${REPO}\n`);
+    process.exit(0);
+  }
+  console.log('\n⚠ 推送命令成功，但远端 head 与本地不一致 —— 请手动核对（可能推到了别的分支/仓库）\n');
+  process.exit(1);
 }
 
 console.log('\n✗ 推送失败。常见原因：');
