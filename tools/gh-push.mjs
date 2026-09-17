@@ -50,17 +50,30 @@ function detectProxy() {
 }
 
 // 端口在监听才算可用（系统代理开了但代理软件没启动是很常见的情况）
+// ★ 2026-09-17 踩坑：这里原本用 `new URL(url)` 解析，运行时抛
+//   `URL is not a constructor`（这个环境里全局 URL 被遮蔽了），异常被 catch 吞掉后
+//   表现为"端口没在监听"，于是明明代理可用却按直连走、推送失败。
+//   教训：**探测函数里的 catch 不要静默吞异常** —— 加一行 debug 输出就能立刻定位。
 function portListening(url) {
+  const dbg = process.env.ATZ_DEBUG_PROXY;
   try {
-    const u = new URL(url);
-    const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    // 不依赖全局 URL：手工拆 host:port
+    const m = String(url).match(/^(?:(\w+):\/\/)?([^/:]+)(?::(\d+))?/);
+    if (!m) throw new Error(`无法解析代理地址: ${url}`);
+    const scheme = m[1] || 'http';
+    const host = m[2];
+    const port = Number(m[3] || (scheme === 'https' ? 443 : 80));
+    if (dbg) console.log(`  [debug] 探测 ${host}:${port} …`);
     return new Promise((resolve) => {
-      const s = net.connect({ host: u.hostname, port, timeout: 1500 });
-      s.on('connect', () => { s.destroy(); resolve(true); });
-      s.on('error', () => resolve(false));
-      s.on('timeout', () => { s.destroy(); resolve(false); });
+      const s = net.connect({ host, port, timeout: 1500 });
+      s.on('connect', () => { if (dbg) console.log('  [debug] connect 成功'); s.destroy(); resolve(true); });
+      s.on('error', (e) => { if (dbg) console.log(`  [debug] error ${e.code} ${e.message}`); resolve(false); });
+      s.on('timeout', () => { if (dbg) console.log('  [debug] timeout'); s.destroy(); resolve(false); });
     });
-  } catch { return Promise.resolve(false); }
+  } catch (e) {
+    if (dbg) console.log(`  [debug] 抛异常 ${e.message}`);
+    return Promise.resolve(false);
+  }
 }
 
 const argv = process.argv.slice(2);
@@ -77,6 +90,8 @@ const BRANCH = arg('branch', 'master');
 // ★ 只用于**本次进程**：临时凭据助手的文件在推送结束后立刻删除，绝不写进仓库配置。
 //   平时手动推送不需要它 —— 弹窗填一次，Windows 凭据管理器会记住。
 const TOKEN = arg('token', process.env.ATZ_GH_TOKEN || '');
+// 排查用：ATZ_DEBUG_PROXY=1 会打印代理探测细节（含失败原因）
+const DEBUG = !!process.env.ATZ_DEBUG_PROXY;
 
 function git(args, opts = {}) {
   return execFileSync(GIT, args, { cwd: ROOT, encoding: 'utf8', stdio: opts.inherit ? 'inherit' : 'pipe' });
@@ -113,7 +128,9 @@ const URL = `https://github.com/${USER}/${REPO}.git`;
 let PROXY = '';
 {
   const cand = detectProxy();
-  if (cand && (await portListening(cand))) {
+  const alive = cand ? await portListening(cand) : false;
+  if (process.env.ATZ_DEBUG_PROXY) console.log(`  [debug] cand=${JSON.stringify(cand)} alive=${alive}`);
+  if (cand && alive) {
     PROXY = cand;
     process.env.HTTPS_PROXY = cand;
     process.env.HTTP_PROXY = cand;
