@@ -1,0 +1,25 @@
+// atz_local.h.example —— 「本机私密覆盖头」模板
+//
+// 怎么用：
+//   1) 把这个文件复制成 atz_local.h，放到**同一个目录**（板目录）：
+//      xiaozhi-esp32\src\main\boards\waveshare\esp32-s3-touch-lcd-1.85-atzgauge\
+//      也可以放到 mods-atzgauge 打补丁后的同名目录里。
+//   2) 改下面的口令，重新编译烧录。
+//
+// 为什么叫 atz_local.h：atz_ui_config.h 末尾会用
+//   #if defined(__has_include) / #if __has_include("atz_local.h") / #include "atz_local.h"
+// 探测这个文件，探测到就 include，所以这里定义的宏会**覆盖** atz_ui_config.h 的默认值。
+// 本文件本身**不进 git**（.gitignore 里 `**/atz_local.h` 已排除），可以放心写口令。
+//
+// 不做这一步也完全没问题：构建会用 atz_ui_config.h 里的公开占位值
+// "atz-local-debug"，调试写接口照样有鉴权，只是口令是公开的。
+//
+// ── 除了口令，还能覆盖别的参数（照抄 atz_ui_config.h 里的宏名即可）──────────
+//   #define ATZ_UI_DEFAULT_THEME   "dark"
+//   #define ATZ_UI_CAR_BAR_ENABLE  1
+// 下游代码都写了 #ifndef 兜底，重复定义不会报错。
+
+#pragma once
+
+// 调试写接口（/theme /carbar /carpage /size /inject /subtitle /trip 等）的 &key= 口令
+#define ATZ_DEBUG_TOKEN             "atz-local-debug"
