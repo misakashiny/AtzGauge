@@ -219,10 +219,28 @@ if (TOKEN) {
 let push;
 try {
   push = spawnSync(GIT, ['push', '-u', REMOTE, BRANCH], { cwd: ROOT, stdio: 'inherit' });
-} finally {
-  // 只注销 helper（仓库配置必须干净）
-  if (TOKEN) tryGit(['config', '--local', '--unset', 'credential.helper']);
+} catch (e) {
+  push = { status: 1 };
 }
+
+// ★ 顺序很重要：**先核对远端 head，再清凭据**。
+//   ls-remote 需要认证，凭据先删掉的话核对会失败（第一版就是这个顺序，白报一次"不一致"）。
+let verified = false;
+if (push.status === 0) {
+  const local = git(['rev-parse', BRANCH]).trim();
+  let remote = '';
+  try {
+    remote = (git(['ls-remote', REMOTE, `refs/heads/${BRANCH}`]).trim().split(/\s+/)[0]) || '';
+  } catch (e) {
+    remote = `<查询失败: ${String(e.message).slice(0, 60)}>`;
+  }
+  console.log(`\n  本地  ${local}`);
+  console.log(`  远端  ${remote}`);
+  verified = !!local && local === remote;
+}
+
+// 清理：注销 helper（仓库配置必须干净）
+if (TOKEN) tryGit(['config', '--local', '--unset', 'credential.helper']);
 
 // ★ 用 --token 推送时，凭据**不许留在系统里**。
 //   实测坑：这台机器 system 层配了 `credential.helper manager`（Git Credential Manager），
@@ -236,17 +254,7 @@ if (TOKEN) {
 }
 
 if (push.status === 0) {
-  // 推完核对一次：远端 head 必须等于本地 head（防止"以为推上去了"）
-  const local = git(['rev-parse', BRANCH]).trim();
-  let remote = '';
-  try {
-    remote = (git(['ls-remote', REMOTE, `refs/heads/${BRANCH}`]).trim().split(/\s+/)[0]) || '';
-  } catch (e) {
-    remote = `<查询失败: ${String(e.message).slice(0, 60)}>`;
-  }
-  console.log(`\n  本地  ${local}`);
-  console.log(`  远端  ${remote}`);
-  if (local && local === remote) {
+  if (verified) {
     console.log(`\n✓ 推送完成并已核对：https://github.com/${USER}/${REPO}\n`);
     process.exit(0);
   }
