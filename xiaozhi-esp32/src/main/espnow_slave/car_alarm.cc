@@ -12,6 +12,7 @@
 #include "obd_data_cache.h"
 
 #include "application.h"
+#include "display.h"      // ★ 需要完整类型：car_alarm_dismiss_alert() 要调 display->SetChatMessage()
 
 #include <stdio.h>
 #include <string.h>
@@ -99,9 +100,13 @@ static void format_value(const car_rule_t &r, int32_t v, char *buf, size_t n)
     }
 }
 
+// 屏幕上是否还挂着告警文字（用于"告警解除时收回"）
+static bool s_alert_shown = false;
+
 // 投递到主任务执行真正的告警（屏幕 + 本地 ogg 音效）
 static void fire_alert(const car_rule_t &r, const char *message)
 {
+    s_alert_shown = true;
     std::string status(r.name);
     std::string msg(message);
     std::string emotion(r.emotion);
@@ -121,6 +126,20 @@ static void evaluate(bool allow_alert)
 
     bool stale = !espnow_slave_has_data();
     int64_t now = esp_timer_get_time();
+
+    // ★ 2026-09-18：记录"这一轮开始时还有哪些告警是活动的"，用来在全部解除时**收回屏幕上的告警文字**。
+    //   踩过的坑：告警值消失（主表断流）后，规则被置为 inactive，但 `Application::Alert()`
+    //   写进字幕里的 "RPM HIGH: 7100 rpm (limit 6500 rpm)" **没人清** —— 用户看到的就是
+    //   "一直显示 RPM HIGH"。上游的 `DismissAlert()` 只在空闲态才清，而且清完还会把状态栏
+    //   设成 standby，所以不能无脑调；真正该做的是"告警解除时把这条告警文字撤掉"
+    //   （如果那行字已经是别的内容，就不要动它 —— 见 car_alarm_dismiss_alert）。
+    bool active_before = false;
+    for (int i = 0; i < s_rule_count; i++) {
+        if (s_rules[i].active) {
+            active_before = true;
+            break;
+        }
+    }
 
     for (int i = 0; i < s_rule_count; i++) {
         car_rule_t &r = s_rules[i];
@@ -178,6 +197,20 @@ static void evaluate(bool allow_alert)
             }
         }
     }
+
+    // ── 告警全部解除 → 把屏幕/字幕上的告警文字收回（见上面 active_before 的说明）──
+    if (active_before) {
+        bool active_after = false;
+        for (int i = 0; i < s_rule_count; i++) {
+            if (s_rules[i].active) {
+                active_after = true;
+                break;
+            }
+        }
+        if (!active_after) {
+            car_alarm_dismiss_alert();
+        }
+    }
 }
 
 // ── 监控任务 ──────────────────────────────────────────────────────────────
@@ -208,6 +241,31 @@ const char *car_alarm_name(car_alarm_id_t id)
         if (s_rules[i].id == id) return s_rules[i].name;
     }
     return "NONE";
+}
+
+// 撤下屏幕上的告警文字（告警解除时由 evaluate() 调用）。
+//
+// ★ 为什么不能直接调 Application::DismissAlert()：那个函数会把状态栏设成 STANDBY、
+//   还会清 last_error_message_ —— 如果用户此刻正在跟小智说话，就会把对话状态弄乱。
+//   这里只做一件事：把**告警留下的那行字幕**清掉。
+//
+// ★ 为什么可以无条件清字幕：告警解除 = 那行字 100% 是告警（用户对话的内容不会因为
+//   "车速降下来了"而消失），而紧接着任何一条新字幕（对话/系统提示）都会重新写入。
+void car_alarm_dismiss_alert(void)
+{
+    if (!s_alert_shown) {
+        return;   // 没弹过告警，别去碰屏幕
+    }
+    s_alert_shown = false;
+    // 交给主任务执行：这条路径跑在告警任务上下文里，UI 更新必须在主任务
+    Application::GetInstance().Schedule([]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display == nullptr) {
+            return;
+        }
+        ESP_LOGI("AtzAlarm", "alarm cleared -> dismiss alarm text on screen");
+        display->SetChatMessage("system", "");
+    });
 }
 
 bool car_alarm_self_test(void)

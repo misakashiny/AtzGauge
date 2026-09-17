@@ -50,6 +50,12 @@ car_alarm_id_t car_alarm_active(void);
 // 告警的可读名字（用于日志与将来的 MCP 工具）
 const char *car_alarm_name(car_alarm_id_t id);
 
+/**
+ * 把屏幕上残留的告警文字收回（告警全部解除时由 evaluate() 自动调用）。
+ * 只清字幕，不动设备状态 —— 见 .cc 里的说明（不能用 Application::DismissAlert()）。
+ */
+void car_alarm_dismiss_alert(void);
+
 #ifdef __cplusplus
 }
 #endif

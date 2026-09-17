@@ -1127,11 +1127,26 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
                                  last_x, last_y);
                         atz_gesture_set_report("tap (no zone)");
                     } else {
+                        // ── 主界面上的点击：开始对话 / 打断（用户 2026-09-18 要求）────────
+                        //   idle      → 开始对话（原来的行为）
+                        //   listening → **再点一下 = 取消，回到待命**（用户："聆听中的时候能
+                        //               再次点击屏幕取消"）。走 StopListening()，它在主任务里
+                        //               发 SendStopListening 给服务端并把状态切回 Idle。
+                        //   speaking  → 打断播报（AbortSpeaking），回到待命
+                        //   其它状态（连接中/配网/升级…）不听点击，避免误操作
                         DeviceState state = app.GetDeviceState();
                         if (state == kDeviceStateIdle) {
                             ESP_LOGI(TAG, "tap -> start conversation");
                             atz_gesture_set_report("tap -> chat");
                             app.ToggleChatState();
+                        } else if (state == kDeviceStateListening) {
+                            ESP_LOGI(TAG, "tap while listening -> cancel listening");
+                            atz_gesture_set_report("tap -> stop listening");
+                            app.StopListening();
+                        } else if (state == kDeviceStateSpeaking) {
+                            ESP_LOGI(TAG, "tap while speaking -> abort speaking");
+                            atz_gesture_set_report("tap -> abort speaking");
+                            app.AbortSpeaking(kAbortReasonNone);
                         } else {
                             ESP_LOGD(TAG, "tap ignored in state %d", (int)state);
                             atz_gesture_set_report("tap (state busy)");
