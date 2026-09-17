@@ -52,3 +52,6 @@ sdkconfig.old
 # 上游 xiaozhi-esp32\.gitignore 也有同名规则，这里再写一遍是为了本仓库独立成立。
 atz_local.h
 **/atz_local.h
+# PORT.txt：这块工作区用哪个串口（每台机器不同，见 tools\atz-port.ps1）。
+# 天然被上面的 /* 排除，这里显式写出来是为了说明"它是故意的，不是漏了"。
+PORT.txt

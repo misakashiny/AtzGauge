@@ -20,8 +20,9 @@ REM
 REM NOTE: %~dp0 is this script's own directory, so it works from any cwd.
 
 set RELEASE=%~dp0..\obd_brz_gauge\firmware\release
+if "%ATZ_PORT%"=="" set ATZ_PORT=COM3
 
-python -m esptool --chip esp32s3 --port COM3 --baud 460800 ^
+python -m esptool --chip esp32s3 --port %ATZ_PORT% --baud 460800 ^
   --before default-reset --after hard-reset ^
   write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB ^
   0x0      "%RELEASE%\bootloader\bootloader.bin" ^

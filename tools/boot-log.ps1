@@ -14,14 +14,22 @@
 #
 # NOTE: pure ASCII on purpose. Windows PowerShell 5.1 reads .ps1 as ANSI/GBK when the
 # file has no UTF-8 BOM, which corrupts non-ASCII literals and breaks parsing.
+#
+# Port resolution (so another PC needs no script edits): -Port argument, then
+# $env:ATZ_PORT, then <workspace>\PORT.txt, then COM3. See tools\atz-port.ps1.
+# NOTE: param() must be the first statement in the script, so the port is resolved
+# right after it (dot-sourcing the helper above param() would be a parse error).
 
 param(
-    [string]$Port = 'COM3',
+    [string]$Port,
     [int]$Seconds = 100,
     [int]$Baud = 115200,
     [int]$ResetDelayMs = 300,
     [switch]$NoReset        # attach only, do NOT pulse RTS -- inspect a running device
 )
+
+. "$PSScriptRoot\atz-port.ps1"
+if (-not $Port) { $Port = Get-AtzPort }
 
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
