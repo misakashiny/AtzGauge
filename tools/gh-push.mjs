@@ -243,14 +243,28 @@ if (push.status === 0) {
 if (TOKEN) tryGit(['config', '--local', '--unset', 'credential.helper']);
 
 // ★ 用 --token 推送时，凭据**不许留在系统里**。
-//   实测坑：这台机器 system 层配了 `credential.helper manager`（Git Credential Manager），
+//   实测坑 1：这台机器 system 层配了 `credential.helper manager`（Git Credential Manager），
 //   即使我们把 local helper 注销了，GCM 仍会把用过的 token 存进 Windows 凭据管理器
 //   （`cmdkey /list` 里能看到 git:https://github.com）。所以用完必须显式删掉。
+//   实测坑 2：临时凭据文件不能"推完立刻删" —— git 还有后台进程要更新凭据存储，
+//   秒删会报 `unable to get credential storage lock ... Permission denied`。
+//   所以这里**先等一会儿再删**（含重试），实在删不掉就留给下次运行清理。
 if (TOKEN) {
   try {
     execFileSync('cmdkey', ['/delete:LegacyGeneric:target=git:https://github.com'], { stdio: 'ignore' });
     console.log('  （已清除 Windows 凭据管理器里的 GitHub 凭据残留）');
   } catch { /* 本来就没有，忽略 */ }
+
+  if (credFile) {
+    await new Promise((r) => setTimeout(r, 2500));   // 等 git 后台凭据进程收工
+    let gone = false;
+    for (let i = 0; i < 5 && !gone; i++) {
+      try { fs.unlinkSync(credFile); gone = true; }
+      catch { await new Promise((r) => setTimeout(r, 800)); }
+    }
+    console.log(gone ? '  （已删除临时凭据文件）'
+      : `  ⚠ 临时凭据文件删不掉：${credFile}（下次运行会自动清理，或手动删除）`);
+  }
 }
 
 if (push.status === 0) {
