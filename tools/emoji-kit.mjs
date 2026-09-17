@@ -68,6 +68,38 @@ function readDebugToken() {
 function die(msg) { console.error(`\n✗ ${msg}\n`); process.exit(1); }
 function kb(n) { return `${(n / 1024).toFixed(1)} KB`; }
 
+/** 中文提示全部放在这里（不放 .cmd 里）：cmd.exe 对非 ASCII 的 .cmd 解析很脆。 */
+const USAGE = `
+换表情包（不用重刷固件）
+
+  · 双击 tools\\emoji-kit.cmd  → 会问你素材文件夹路径
+  · 或把素材文件夹拖到 emoji-kit.cmd 上
+  · 或在这里直接敲（三种常用）：
+      node tools\\emoji-kit.mjs --ask                        问我路径
+      node tools\\emoji-kit.mjs --dir "D:\\表情包\\方案A"       直接推送
+      node tools\\emoji-kit.mjs --builtin                    换回内置表情
+
+  其他开关：--check 只体检 ｜ --dry-run 只打包 ｜ --allow-missing 缺的用内置补
+            --no-push 只起服务器 ｜ --device <IP> 换设备 ｜ --port <n> 换端口
+`;
+
+// ── 交互式问路径（双击流程用）───────────────────────────────────────────────
+async function askFolder() {
+  const rl = (await import('node:readline/promises')).createInterface({
+    input: process.stdin, output: process.stdout,
+  });
+  console.log(USAGE);
+  console.log(`素材文件夹里放 PNG（推荐 128×128、透明底）。`);
+  console.log(`不确定文件名？先跑一次： node tools\\emoji-kit.mjs --list-builtins`);
+  console.log(`\n把文件夹拖进这个窗口，然后回车 —— 只拖文件夹，不要再加 --参数。`);
+  console.log(`★ 建议用"拖进来"而不是手打：Windows 控制台对**中文路径**的输入编码不可靠`);
+  console.log(`  （拖进来是命令行参数，Node 直接拿到 Unicode，不会有编码问题）。\n`);
+  const ans = (await rl.question('素材文件夹路径（留空=退出）: ')).trim().replace(/^"|"$/g, '');
+  rl.close();
+  if (!ans) { console.log('\n没有输入路径，已退出。'); process.exit(0); }
+  return ans;
+}
+
 // ── 素材清单（内置 21 个名字 = 契约）─────────────────────────────────────────
 function builtinNames() {
   if (!fs.existsSync(BUILTIN_DIR)) die(`找不到内置表情目录：${BUILTIN_DIR}`);
@@ -102,7 +134,15 @@ function check(dir) {
   const files = fs.existsSync(dir)
     ? fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.png'))
     : [];
-  if (files.length === 0) die(`目录里没有 PNG：${dir}`);
+  if (files.length === 0) {
+    const shown = path.resolve(String(dir));
+    die(`这个文件夹里没有 PNG 文件：\n  ${shown}\n` +
+        (fs.existsSync(dir)
+          ? '  （目录存在，但里面没有 .png —— 素材要直接放在这个目录下，不认子目录）'
+          : '  （目录不存在：路径打错了吗？注意不要把 --参数 跟路径写在同一行）') +
+        `\n\n  正确做法：把文件夹拖进窗口，只拖文件夹本身，然后回车。` +
+        `\n  或者用参数：node tools\\emoji-kit.mjs --dir "${shown}"`);
+  }
 
   const got = new Map();
   const problems = [];
@@ -334,7 +374,26 @@ async function main() {
     return;
   }
 
-  const dir = arg('dir');
+  // --builtin：一键回到内置表情（= 用 backup\emoji-test 里那份内置素材副本）
+  let dir = arg('dir');
+  if (has('builtin')) {
+    dir = path.join(REPO, 'backup/emoji-test');
+    process.argv.push('--allow-missing', '--yes');
+    if (!fs.existsSync(dir)) {
+      // 副本没了就现做一份
+      fs.mkdirSync(dir, { recursive: true });
+      for (const f of fs.readdirSync(BUILTIN_DIR)) {
+        fs.copyFileSync(path.join(BUILTIN_DIR, f), path.join(dir, f));
+      }
+    }
+    console.log(`--builtin：用内置素材打包（${dir}）`);
+  }
+  // --ask：双击流程（.cmd 不带参数）→ 交互式问路径
+  if (has('ask')) {
+    dir = await askFolder();
+    process.argv.push('--yes');
+  }
+
   const checkOnly = arg('check');
   if (checkOnly) {
     const r = check(String(checkOnly));
@@ -342,8 +401,7 @@ async function main() {
     process.exit(r.problems.length ? 1 : 0);
   }
   if (!dir && !has('serve-only')) {
-    console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 22)
-      .map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
+    console.log(USAGE);
     process.exit(0);
   }
 
@@ -355,7 +413,7 @@ async function main() {
     if (r.problems.length) die('先修掉"必须修的问题"，再重新运行');
     if (r.missing.length) {
       console.log(`\n缺少 ${r.missing.length} 个 → 这些会**保留基线里的原图**（不会崩，但风格会不统一）`);
-      if (!has('allow-missing')) {
+      if (!has('allow-missing') && !has('yes')) {
         console.log('  （要就这样打包，加 --allow-missing）');
         process.exit(2);
       }
