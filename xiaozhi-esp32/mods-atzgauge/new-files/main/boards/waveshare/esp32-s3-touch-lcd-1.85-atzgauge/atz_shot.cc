@@ -37,6 +37,7 @@ httpd_handle_t g_server = nullptr;
 esp_err_t CarBarHandler(httpd_req_t* req);
 esp_err_t TouchHandler(httpd_req_t* req);
 esp_err_t TapHandler(httpd_req_t* req);
+esp_err_t SwipeHandler(httpd_req_t* req);
 esp_err_t CarPageHandler(httpd_req_t* req);
 esp_err_t SizeHandler(httpd_req_t* req);
 esp_err_t PerfHandler(httpd_req_t* req);
@@ -419,6 +420,12 @@ void StartTask(void* arg) {
                 .handler = TapHandler,
                 .user_ctx = nullptr,
             };
+            httpd_uri_t swipe_uri = {
+                .uri = "/swipe",
+                .method = HTTP_GET,
+                .handler = SwipeHandler,
+                .user_ctx = nullptr,
+            };
             httpd_register_uri_handler(g_server, &shot_uri);
             httpd_register_uri_handler(g_server, &health_uri);
             httpd_register_uri_handler(g_server, &theme_uri);
@@ -452,6 +459,9 @@ void StartTask(void* arg) {
             }
             if (httpd_register_uri_handler(g_server, &tap_uri) != ESP_OK) {
                 ESP_LOGE(TAG, "/tap registration failed (max_uri_handlers too small?)");
+            }
+            if (httpd_register_uri_handler(g_server, &swipe_uri) != ESP_OK) {
+                ESP_LOGE(TAG, "/swipe registration failed (max_uri_handlers too small?)");
             }
 
             ESP_LOGI(TAG, "screen snapshot ready: http://" IPSTR ":%d/shot.jpg", IP2STR(&ip.ip),
@@ -562,6 +572,7 @@ esp_err_t TapHandler(httpd_req_t* req) {
     if (!WriteAllowed(req)) {   // 合成点击会改状态，算写操作
         return DenyWrite(req);
     }
+    // 特殊：/tap?x=-1&y=-1 之外，用 /swipe 端点模拟滑动（见下）
     const int id = atz_hit_zone_test(x, y);
     const char* name = "(none)";
     if (id >= 0) {
@@ -572,6 +583,49 @@ esp_err_t TapHandler(httpd_req_t* req) {
         ESP_LOGI(TAG, "/tap (%d,%d) -> no zone hit", x, y);
     }
     snprintf(body, sizeof(body), "tap (%d,%d) -> zone=%d [%s]\n", x, y, id, name);
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+// 台架用：**合成一次滑动手势**（不碰触摸硬件）—— 验证"滑动 → 翻页/进车况页"这条链路。
+//   http://<设备IP>:8099/swipe?dir=left&key=…    左划（车况页→行程页；主界面→车况页）
+//   http://<设备IP>:8099/swipe?dir=right&key=…   右划（行程页→车况页）
+// 不带 dir 时只报告当前注册了哪些滑动回调。
+esp_err_t SwipeHandler(httpd_req_t* req) {
+    char query[64] = {};
+    char value[16] = {};
+    const bool has = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+                     httpd_query_key_value(query, "dir", value, sizeof(value)) == ESP_OK;
+    char body[256];
+    if (!has) {
+        snprintf(body, sizeof(body),
+                 "car page visible=%d page=%d\n"
+                 "swipe handlers: LEFT=%d RIGHT=%d (0 = falls back to main-screen rule)\n"
+                 "note: dir=left on the main screen is handled by the touch task\n",
+                 (int)atz_car_page_visible(), atz_car_page_page(),
+                 (int)atz_swipe_has_handler(ATZ_SWIPE_LEFT),
+                 (int)atz_swipe_has_handler(ATZ_SWIPE_RIGHT));
+        return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    }
+    if (!WriteAllowed(req)) {
+        return DenyWrite(req);
+    }
+    const int dir = (strcmp(value, "left") == 0) ? ATZ_SWIPE_LEFT : ATZ_SWIPE_RIGHT;
+    if (!atz_swipe_has_handler(dir)) {
+        // 没有注册回调 = 当前页不响应这个方向。主界面左划那条规则在触摸任务里，
+        // 这里补一次等价动作，方便台架验证"主界面左划进车况页"。
+        if (dir == ATZ_SWIPE_LEFT && !atz_car_page_visible()) {
+            atz_car_page_show();
+            snprintf(body, sizeof(body), "swipe LEFT (no handler) -> main-screen rule: car page shown\n");
+            return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+        }
+        snprintf(body, sizeof(body), "swipe %s -> no handler on this page (ignored)\n", value);
+        return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    }
+    atz_swipe_fire(dir);
+    char rep[48] = {};
+    atz_gesture_report(rep, sizeof(rep));
+    snprintf(body, sizeof(body), "swipe %s fired -> page=%d  report=%s\n", value,
+             atz_car_page_page(), rep);
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 

@@ -77,6 +77,17 @@
 #define TP_LEGACY_PATH      1
 #define TP_DIAG             0       // 1 = print a 5s read counter heartbeat (bring-up aid)
 
+// ── 手势判定阈值（2026-09-17 新增滑动翻页）──────────────────────────────────
+// 同一条触摸流里区分"点击"与"左右滑动"：
+//   · 抬起时**最大位移** < ATZ_TAP_SLOP_PX            → 点击（交给点击区）
+//   · 水平位移 ≥ ATZ_SWIPE_MIN_PX 且 ≥ 2×垂直位移     → 左滑/右滑
+//   · 其它 → 什么都不做（避免"慢慢拖一下"被当成滑动）
+// 数值依据：面板 360px 宽，屏幕可见直径 360px；40px 大约是屏幕宽度的 1/9，
+// 小于它的横向移动基本都是手指抖动或按按钮时的偏移。
+#define ATZ_TAP_SLOP_PX     (20)    // 点击容差：位移小于它才算"点了一下"
+#define ATZ_SWIPE_MIN_PX    (40)    // 触发滑动所需的最小水平位移
+#define ATZ_SWIPE_MAX_MS    (1200)  // 超过这么久还在按 → 不当滑动（可能是误触/长按）
+
 // Start the car-alarm monitor.
 //
 // Why a task instead of calling car_alarm_start() straight from the board
@@ -1015,11 +1026,16 @@ bool atz_touch_watch(int seconds, char* out, size_t out_len) {
     return board->TouchWatch(seconds, out, out_len);
 }
 
-// Polls the CST816S and fires one "start conversation" per tap.
+// Polls the CST816S and turns the touch stream into gestures.
 //
-// Policy: only kDeviceStateIdle reacts. Every other state (connecting, listening,
-// speaking, notifying, wifi-configuring, upgrading, ...) ignores the tap, so a
-// stray touch while the assistant is answering can never cut it off.
+// 2026-09-17：从"按下即触发"改成**抬起时判手势**，这样才能同时支持点击与左右滑动
+// （用户要求"车况页向左划进行程页、行程页向右划回车况页、主界面向左划进车况页"）。
+//   点击 → 命中区（按钮）或（主界面空闲时）开始对话
+//   左划 / 右划 → 交给当前页注册的滑动回调
+// 为什么在抬起时判：滑动过程中会一路划过很多控件，按下就触发的话会误按一堆按钮。
+//
+// Policy: 只有 kDeviceStateIdle 会响应"点击开始对话"。其它状态（连接/聆听/说话/
+// 配网/升级…）忽略点击，避免应答过程中被误触打断。滑动不受设备状态影响（它只切页面）。
 //
 // Runs on its own task and only touches thread-safe entry points:
 // Application::ToggleChatState() just sets an event bit, which the main loop
@@ -1034,6 +1050,12 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
     uint8_t last_finger = 0;
     int last_x = -1, last_y = -1;
     int last_hit = -1;
+
+    // ── 手势状态（一次按下→抬起为一次手势）────────────────────────────────
+    int start_x = -1, start_y = -1;
+    int max_dx = 0;              // 过程中最大的水平位移（绝对值）
+    int max_dy = 0;              // 过程中最大的垂直位移（绝对值）
+    int64_t press_start_us = 0;
 
     while (true) {
         uint8_t data[5] = {};
@@ -1060,39 +1082,94 @@ void AtzGaugeBoard::TouchPollTask(void* arg) {
             // ★ 每次采样都算一次命中：即使 `latched` 已经为真，也要继续更新 last_hit，
             //   这样 /touch 自检才能报告"手指现在压在哪个区"（调排版时很有用）。
             last_hit = (last_x >= 0) ? atz_hit_zone_test(last_x, last_y) : -1;
+
+            // 记录起点与过程中的最大位移（用于抬起时判手势）
+            if (start_x < 0 && last_x >= 0) {
+                start_x = last_x;
+                start_y = last_y;
+                max_dx = 0;
+                max_dy = 0;
+            } else if (start_x >= 0) {
+                const int dx = (last_x >= start_x) ? (last_x - start_x) : (start_x - last_x);
+                const int dy = (last_y >= start_y) ? (last_y - start_y) : (start_y - last_y);
+                if (dx > max_dx) max_dx = dx;
+                if (dy > max_dy) max_dy = dy;
+            }
+
             if (!latched && ++down_samples >= TP_CONFIRM_SAMPLES) {
                 latched = true;
+                press_start_us = esp_timer_get_time();
                 atz_dim_kick();   // 有人碰屏幕 = 有交互 → 立刻恢复全亮
-                if (last_hit >= 0) {
-                    // ── 点到「点击区」= 真的去按那个按钮 ──────────────────────
-                    // ★ 2026-09-17 的根因修复：本项目**没有给 LVGL 注册输入设备**，
-                    //   所以 lv_button 的 LV_EVENT_CLICKED 永远不触发（用户报"按钮点不动"
-                    //   就是这个）。命中判定改成自己算，链路见 atz_hit_zone.h。
-                    const char* zone_name = "(unnamed)";
-                    int zx1 = 0, zy1 = 0, zx2 = 0, zy2 = 0;
-                    atz_hit_zone_info(last_hit, &zx1, &zy1, &zx2, &zy2, &zone_name);
-                    ESP_LOGI(TAG, "touch tap (%d,%d) -> hit zone %d [%s] (%d,%d)-(%d,%d)",
-                             last_x, last_y, last_hit, zone_name, zx1, zy1, zx2, zy2);
-                    atz_hit_zone_fire(last_hit);   // 回调自己加显示锁
-                } else if (atz_car_page_visible()) {
-                    // 车况/行程整屏页开着、但没点到任何按钮：**什么都不做**。
-                    // （以前这里是"点一下翻页"，结果用户想按按钮时被翻页抢走了 ——
-                    //   现在翻页有自己的点击区，见 atz_car_page.cc。）
-                    ESP_LOGI(TAG, "touch tap (%d,%d) on car page -> no zone hit, ignored",
-                             last_x, last_y);
-                } else {
-                    DeviceState state = app.GetDeviceState();
-                    if (state == kDeviceStateIdle) {
-                        ESP_LOGI(TAG, "touch tap -> start conversation");
-                        app.ToggleChatState();
-                    } else {
-                        ESP_LOGD(TAG, "touch tap ignored in state %d", (int)state);
-                    }
-                }
+                // ★ 注意：这里**不再触发动作** —— 动作推迟到抬起时判手势（见下面的 else 分支）
             }
         } else {
+            // ── 手指抬起：判定这次是"点击"还是"滑动" ────────────────────────
+            if (latched && start_x >= 0) {
+                const int64_t held_ms = (esp_timer_get_time() - press_start_us) / 1000;
+                const int dx_signed = last_x - start_x;
+                const bool horizontal_enough = max_dx >= ATZ_SWIPE_MIN_PX &&
+                                               max_dx >= 2 * max_dy && held_ms <= ATZ_SWIPE_MAX_MS;
+                if (max_dx < ATZ_TAP_SLOP_PX && max_dy < ATZ_TAP_SLOP_PX) {
+                    // ── 点击（位移在容差内）────────────────────────────────
+                    if (last_hit >= 0) {
+                        const char* zone_name = "(unnamed)";
+                        int zx1 = 0, zy1 = 0, zx2 = 0, zy2 = 0;
+                        atz_hit_zone_info(last_hit, &zx1, &zy1, &zx2, &zy2, &zone_name);
+                        ESP_LOGI(TAG, "tap (%d,%d) -> zone %d [%s] (%d,%d)-(%d,%d)", last_x, last_y,
+                                 last_hit, zone_name, zx1, zy1, zx2, zy2);
+                        char rep[48];
+                        snprintf(rep, sizeof(rep), "tap zone=%d [%s]", last_hit, zone_name);
+                        atz_gesture_set_report(rep);
+                        atz_hit_zone_fire(last_hit);   // 回调自己加显示锁
+                    } else if (atz_car_page_visible()) {
+                        // 整屏页开着、没点到任何控件：什么都不做（避免误触发对话）
+                        ESP_LOGI(TAG, "tap (%d,%d) on full-screen page -> no zone, ignored",
+                                 last_x, last_y);
+                        atz_gesture_set_report("tap (no zone)");
+                    } else {
+                        DeviceState state = app.GetDeviceState();
+                        if (state == kDeviceStateIdle) {
+                            ESP_LOGI(TAG, "tap -> start conversation");
+                            atz_gesture_set_report("tap -> chat");
+                            app.ToggleChatState();
+                        } else {
+                            ESP_LOGD(TAG, "tap ignored in state %d", (int)state);
+                            atz_gesture_set_report("tap (state busy)");
+                        }
+                    }
+                } else if (horizontal_enough) {
+                    // ── 滑动（水平位移够大且远大于垂直位移）────────────────
+                    const int dir = (dx_signed < 0) ? ATZ_SWIPE_LEFT : ATZ_SWIPE_RIGHT;
+                    if (atz_swipe_has_handler(dir)) {
+                        ESP_LOGI(TAG, "swipe %s (dx=%d dy=%d held=%d ms) -> firing handler",
+                                 dir == ATZ_SWIPE_LEFT ? "LEFT" : "RIGHT", dx_signed, max_dy,
+                                 (int)held_ms);
+                        atz_swipe_fire(dir);
+                    } else if (!atz_car_page_visible() && dir == ATZ_SWIPE_LEFT) {
+                        // ★ 主界面（表情页）向左划 → 直接进「车况」整屏页（用户要求）。
+                        //   整屏页开着时由页面自己注册滑动回调（见 atz_car_page.cc 的
+                        //   ApplyZoneEnable），所以这里只在"没有 handler + 页面没开"时兜底。
+                        ESP_LOGI(TAG, "swipe LEFT on main screen -> show car page");
+                        atz_gesture_set_report("swipe LEFT -> car page");
+                        atz_car_page_show();
+                    } else {
+                        ESP_LOGD(TAG, "swipe %s ignored (no handler)",
+                                 dir == ATZ_SWIPE_LEFT ? "LEFT" : "RIGHT");
+                        atz_gesture_set_report("swipe (no handler)");
+                    }
+                } else {
+                    ESP_LOGD(TAG, "gesture ignored (dx=%d dy=%d held=%d ms)", max_dx, max_dy,
+                             (int)held_ms);
+                    atz_gesture_set_report("gesture ignored");
+                }
+            }
             down_samples = 0;
             latched = false;
+            start_x = -1;
+            start_y = -1;
+            max_dx = 0;
+            max_dy = 0;
+            last_hit = -1;   // 清掉，免得 /touch 报告"上一次"的命中区误导判断
         }
 
         // Bring-up aid: one line every 5s telling whether the panel answers at all.

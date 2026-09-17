@@ -54,3 +54,31 @@ void atz_hit_zone_set_name(int id, const char* name);
  */
 void atz_hit_zone_set_enabled(int id, bool enabled);
 bool atz_hit_zone_enabled(int id);
+
+// ── 滑动手势（2026-09-17 新增）──────────────────────────────────────────────
+// 为什么和"点击区"放同一个模块：**同一条触摸流**必须先判"这是滑动还是点击"，
+// 再决定交给滑动回调还是点击区回调。拆成两个模块就会出现"两边都以为对方处理了"。
+// 判据（在板级 TouchPollTask 里实现，阈值见 esp32-s3-touch-lcd-1.85-atzgauge.cc）：
+//   · 手指抬起时最大位移 < 点击容差                    → 点击（走 atz_hit_zone_test/fire）
+//   · 水平位移 ≥ 滑动阈值，且 ≥ 2×垂直位移             → 左滑 / 右滑
+//   · 其它（慢慢拖、斜着划、按太久）                    → 什么都不做
+enum {
+    ATZ_SWIPE_LEFT = 0,    // 手指从右往左划（←）
+    ATZ_SWIPE_RIGHT = 1,   // 手指从左往右划（→）
+    ATZ_SWIPE_COUNT = 2,
+};
+
+/** 注册滑动回调；传 nullptr 表示当前页不响应这个方向。每页切换时重新注册。 */
+void atz_swipe_set_handler(int dir, atz_hit_cb_t cb, void* user);
+
+/** 触发某个方向的滑动回调（由触摸任务在"手指抬起且判定为滑动"时调用）。 */
+void atz_swipe_fire(int dir);
+
+/** 当前是否注册了该方向的回调（/touch 自检用）。 */
+bool atz_swipe_has_handler(int dir);
+
+/** 最近一次手势判定的文字描述（"tap zone=1" / "swipe LEFT" / "none" …），给 /touch 用。 */
+void atz_gesture_report(char* buf, unsigned len);
+
+/** 由板级触摸任务记录最近一次手势描述（点击/无操作）。 */
+void atz_gesture_set_report(const char* text);

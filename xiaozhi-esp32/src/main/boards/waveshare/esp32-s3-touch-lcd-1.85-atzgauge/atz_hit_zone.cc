@@ -173,3 +173,54 @@ bool atz_hit_zone_info(int i, int* x1, int* y1, int* x2, int* y2, const char** n
     }
     return true;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 滑动手势（2026-09-17 新增）
+//
+// 和点击共用一条触摸流：手指抬起时先判"滑动还是点击"，再决定交给谁。
+// 阈值与判定在板级 TouchPollTask 里（它才拿得到时间戳与坐标序列）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+atz_hit_cb_t g_swipe_cb[ATZ_SWIPE_COUNT] = {nullptr, nullptr};
+void* g_swipe_user[ATZ_SWIPE_COUNT] = {nullptr, nullptr};
+char g_last_gesture[48] = "none";
+}  // namespace
+
+void atz_swipe_set_handler(int dir, atz_hit_cb_t cb, void* user) {
+    if (dir < 0 || dir >= ATZ_SWIPE_COUNT) {
+        return;
+    }
+    g_swipe_cb[dir] = cb;
+    g_swipe_user[dir] = user;
+    ESP_LOGI(TAG, "swipe %s handler %s", dir == ATZ_SWIPE_LEFT ? "LEFT" : "RIGHT",
+             cb != nullptr ? "registered" : "cleared");
+}
+
+void atz_swipe_fire(int dir) {
+    if (dir < 0 || dir >= ATZ_SWIPE_COUNT) {
+        return;
+    }
+    atz_hit_cb_t cb = g_swipe_cb[dir];
+    void* user = g_swipe_user[dir];
+    snprintf(g_last_gesture, sizeof(g_last_gesture), "swipe %s%s",
+             dir == ATZ_SWIPE_LEFT ? "LEFT" : "RIGHT", cb == nullptr ? " (no handler)" : "");
+    if (cb != nullptr) {
+        cb(user);   // 与点击区一样：不持锁回调，回调自己加显示锁
+    }
+}
+
+bool atz_swipe_has_handler(int dir) {
+    return dir >= 0 && dir < ATZ_SWIPE_COUNT && g_swipe_cb[dir] != nullptr;
+}
+
+void atz_gesture_report(char* buf, unsigned len) {
+    if (buf == nullptr || len == 0) {
+        return;
+    }
+    snprintf(buf, len, "%s", g_last_gesture);
+}
+
+void atz_gesture_set_report(const char* text) {
+    snprintf(g_last_gesture, sizeof(g_last_gesture), "%s", text != nullptr ? text : "none");
+}

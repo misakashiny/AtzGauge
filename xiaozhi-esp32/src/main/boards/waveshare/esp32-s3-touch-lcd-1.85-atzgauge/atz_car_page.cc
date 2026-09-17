@@ -69,13 +69,13 @@ static inline int SafeWidthAt(int y) {
     return (int)w;
 }
 
-// ── 底部提示 / 状态文字的位置（★ 修"两行字叠在一起"）────────────────────────
-// 以前 g_stale_label 与 g_hint_label **只差 2px**，同时出现时就是一团糊字。
-// 现在各占一行，且都在圆内（判据：四角最远 ≤176，R=180）：
-//   「检查主表与信道」140px → y∈19..310 → 取 276
-//   「行程统计」100px       → y∈11..318 → 取 308（必须和上面那行错开，行盒 31px）
-#define ATZ_CAR_STALE_Y           276
-#define ATZ_CAR_HINT_Y            308
+// ── "主表无数据"提示的位置（2026-09-18 再调）────────────────────────────────
+// ★ 用户报"检查主表与信道 和文字重叠了"：真凶是**上游的低电量弹窗**
+//   （`low_battery_popup_`，实测 y=309..339、x=110..249）压在这一带上。
+//   现在底部那行「行程统计」提示已经删掉（翻页改用左右滑动），于是把无数据提示
+//   挪到**腾空出来的那一行** y=308，彻底离开数据区。
+//   圆内判据：140px 宽、行盒 31px → y∈19..310，取 308 时四角最远 172.3 ✓
+#define ATZ_CAR_STALE_Y           308
 // 车况页内容列（hero 行 + 字段网格）的顶部位置。
 // ★ 这个 y 与列宽是**联立解出来的**，别单独改其中一个。
 //   内容列固有高度 = hero 105 + 行距 8 + 网格(4 行 × 31 + 3×3 间距 = 133) = 246px。
@@ -109,7 +109,6 @@ static inline int SafeWidthAt(int y) {
 // 状态 + 时长 + 按钮三样并排放不下（实测：时长和按钮都放在 y=38 时完全重叠）。
 #define ATZ_TRIP_BTN_H            26      // 按钮高度（★ 触摸目标：越高越好按）
 #define ATZ_TRIP_BTN_W            100     // 单按钮宽（两个 + 8 间距 = 208）
-#define ATZ_TRIP_HINT_Y           304     // 底部提示（「返回车况 0:04」150px → y 允许 21..308）
 #define ATZ_TRIP_COL_Y            122     // 数据网格（grid 122..259，四角全在圆内）
 
 // 配色（参考 obd_brz_gauge 的深色仪表风）
@@ -134,7 +133,6 @@ lv_obj_t* g_grid = nullptr;       // 其余字段（flex row wrap）
 lv_timer_t* g_timer = nullptr;
 lv_obj_t* g_link_label = nullptr;
 lv_obj_t* g_stale_label = nullptr;
-lv_obj_t* g_hint_label = nullptr;   // 底部一行小字：提示"点一下看行程"
 
 // ── 「行程」页（page1）──────────────────────────────────────────────────────
 int g_page_no = 0;                  // 0 = 车况，1 = 行程
@@ -146,12 +144,9 @@ lv_obj_t* g_trip_status = nullptr;  // 操作结果提示（点按钮后回一�
 lv_obj_t* g_rec_btn = nullptr;
 lv_obj_t* g_rec_btn_label = nullptr;
 lv_obj_t* g_reset_btn = nullptr;
-lv_obj_t* g_trip_hint = nullptr;    // 底部「▴ 返回车况」（本身是点击区）
 int64_t g_trip_status_until_us = 0; // 状态提示的显示截止时间
 
 // 点击区 id（注册时记下来，翻页时按页启用/停用；-1 = 还没注册/注册失败）
-int g_zone_flip_trip = -1;   // 车况页底部 → 行程页
-int g_zone_flip_car = -1;    // 行程页底部 → 车况页
 int g_zone_rec = -1;         // 行程页「开始/暂停记录」
 int g_zone_reset = -1;       // 行程页「清零重来」
 
@@ -186,8 +181,9 @@ void RefreshTripPage(void);
 void BuildTripPage(lv_obj_t* parent);
 void RegisterHitZones(void);
 void ApplyZoneEnable(void);
-void HitFlipToTrip(void* user);
-void HitFlipToCar(void* user);
+void RegisterMainScreenGestures(void);
+void SwipeNext(void* user);
+void SwipePrev(void* user);
 
 /** 注册一块点击区并起名（名字会出现在 /touch 自检与日志里，便于确认"点到的是哪个按钮"）。 */
 int RegisterZone(int x1, int y1, int x2, int y2, atz_hit_cb_t cb, const char* name) {
@@ -462,10 +458,9 @@ lv_obj_t* MakeLabel(lv_obj_t* parent, const char* text, uint32_t color, const lv
     return label;
 }
 
-// 屏幕中心坐标 → 控件（用 CENTER 对齐，保证圆屏边缘不被切）
-void PlaceAt(lv_obj_t* obj, int dx, int dy) {
-    lv_obj_align(obj, LV_ALIGN_CENTER, dx, dy);
-}
+// ★ 原来的 PlaceAt()（LV_ALIGN_CENTER 定位）已经**全部删除**：
+//   CENTER 要按对象"当前高度"算偏移，而刚建好的对象高度还是 LV_SIZE_CONTENT(0)，
+//   实测错位 100+ px（缺陷 #23）。现在统一用 LV_ALIGN_TOP_MID + 绝对 y。
 
 // 透明容器：flex 用它来排版，不要默认主题的背景/描边/内边距
 lv_obj_t* MakeBox(lv_obj_t* parent) {
@@ -562,17 +557,12 @@ void BuildPage(lv_obj_t* screen) {
         BuildCell((FieldIndex)i);
     }
 
-    // ── 底部两行提示（★ 曾经两行相差 2px 叠在一起，现在各占一行）──────────────
-    // y=302「检查主表与信道」：只在无数据时显示
+    // ── 底部一行提示：主表无数据（只在无数据时显示）──────────────────────────
+    // 位置见 ATZ_CAR_STALE_Y 的说明（挪到 y=308 是为了躲开上游低电量弹窗）
     g_stale_label = MakeLabel(g_page, "检查主表与信道", ATZ_PAGE_ALARM, nullptr);
     lv_obj_set_style_text_align(g_stale_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_stale_label, LV_ALIGN_TOP_MID, 0, ATZ_CAR_STALE_Y);
     lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
-
-    // y=332「▾ 行程统计」：翻页按钮的提示（本身就是一块点击区，见下方 RegisterHitZones）
-    g_hint_label = MakeLabel(g_page, "行程统计", ATZ_PAGE_STALE, nullptr);
-    lv_obj_set_style_text_align(g_hint_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_hint_label, LV_ALIGN_TOP_MID, 0, ATZ_CAR_HINT_Y);
 
     BuildTripPage(g_page);   // 「行程」页（page1）：默认隐藏
 
@@ -671,25 +661,20 @@ void RefreshTripPage(void) {
     //      拆开之后每行都只占 ~70px，稳稳在圆内。
     //    ★ 时长必须是"从按下开始记录起累计"的秒数（atz_trip 里累加），不是开机秒数。
     if (g_trip_title != nullptr) {
-        const char* want = rec ? "记录中" : "已暂停";
-        if (strcmp(lv_label_get_text(g_trip_title), want) != 0) {
-            lv_label_set_text(g_trip_title, want);
+        char text[32];
+        const uint32_t sec = t.uptime_s;
+        snprintf(text, sizeof(text), "%s %lu:%02lu", rec ? "记录中" : "已暂停",
+                 (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+        if (strcmp(lv_label_get_text(g_trip_title), text) != 0) {
+            lv_label_set_text(g_trip_title, text);
             atz_perf_count_push();
         }
         lv_obj_set_style_text_color(g_trip_title,
                                     lv_color_hex(rec ? ATZ_PAGE_OK : ATZ_PAGE_STALE), 0);
     }
-    // 已记录时长显示在**底部提示**里（「返回车况 0:04」）：顶部那一段可用宽只有 247px，
-    // 状态 + 时长 + 按钮并排放不下（实测：时长和按钮都放同一行时完全重叠）。
-    if (g_trip_hint != nullptr) {
-        char text[40];
-        const uint32_t sec = t.uptime_s;
-        snprintf(text, sizeof(text), "返回车况 %lu:%02lu:%02lu", (unsigned long)(sec / 3600),
-                 (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
-        if (strcmp(lv_label_get_text(g_trip_hint), text) != 0) {
-            lv_label_set_text(g_trip_hint, text);
-        }
-    }
+    // 已记录时长：并入状态行（"记录中 0:03"）。★ 时长单独一行试过，会和按钮行贴住；
+    // 放底部提示行也试过，但底部提示已经删除（翻页改用滑动）。合并后实测宽度 ~110px，
+    // 远小于 y=2..64 那一段圆屏可用宽度。
     if (g_rec_btn_label != nullptr) {
         const char* want = rec ? "暂停记录" : "开始记录";
         if (strcmp(lv_label_get_text(g_rec_btn_label), want) != 0) {
@@ -744,10 +729,8 @@ void ApplyPageVisibility(void) {
     if (g_page_no == 1) {
         if (g_col != nullptr) lv_obj_add_flag(g_col, LV_OBJ_FLAG_HIDDEN);
         if (g_stale_label != nullptr) lv_obj_add_flag(g_stale_label, LV_OBJ_FLAG_HIDDEN);
-        if (g_hint_label != nullptr) lv_obj_add_flag(g_hint_label, LV_OBJ_FLAG_HIDDEN);
         if (g_trip_col != nullptr) lv_obj_remove_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);
         if (g_trip_hdr != nullptr) lv_obj_remove_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
-        if (g_trip_hint != nullptr) lv_obj_remove_flag(g_trip_hint, LV_OBJ_FLAG_HIDDEN);
         // ★ 行程页**藏掉顶部那条"● 行程"**：它和本页自己的状态行（"● 记录中 0:00:02"）
         //   都挤在屏幕最上方，两行字挨在一起看着就是"重叠"（实测截图确认）。
         //   行程页的页名已由数据本身表达，顶部这条是多余的。
@@ -758,10 +741,8 @@ void ApplyPageVisibility(void) {
         //   车况页叠在一起（实测：翻回第 1 页后状态行/按钮/卡片还在，像两页糊在一起）。
         if (g_trip_col != nullptr) lv_obj_add_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);
         if (g_trip_hdr != nullptr) lv_obj_add_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
-        if (g_trip_hint != nullptr) lv_obj_add_flag(g_trip_hint, LV_OBJ_FLAG_HIDDEN);
         if (g_col != nullptr) lv_obj_remove_flag(g_col, LV_OBJ_FLAG_HIDDEN);
         // g_stale_label 的显示/隐藏由 RefreshPage() 按数据新鲜度决定，这里不碰
-        if (g_hint_label != nullptr) lv_obj_remove_flag(g_hint_label, LV_OBJ_FLAG_HIDDEN);
         if (g_link_label != nullptr) lv_obj_remove_flag(g_link_label, LV_OBJ_FLAG_HIDDEN);
         RefreshPage();   // 顶部链接状态与数值由它填
     }
@@ -884,16 +865,10 @@ void BuildTripPage(lv_obj_t* parent) {
     lv_obj_center(reset_label);
     lv_obj_add_event_cb(g_reset_btn, ResetBtnCb, LV_EVENT_CLICKED, nullptr);
 
-    // ── 底部翻页提示（y=332，dy=153 → 可用 ~189px）：文字短、本身就是点击区 ──
-    g_trip_hint = MakeLabel(parent, "返回车况", ATZ_PAGE_STALE, nullptr);
-    lv_obj_set_style_text_align(g_trip_hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_trip_hint, LV_ALIGN_TOP_MID, 0, ATZ_TRIP_HINT_Y);
-
     RegisterHitZones();
 
     lv_obj_add_flag(g_trip_col, LV_OBJ_FLAG_HIDDEN);   // 默认显示的是车况页
     lv_obj_add_flag(g_trip_hdr, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(g_trip_hint, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -902,29 +877,26 @@ void BuildTripPage(lv_obj_t* parent) {
 // 几何按上面的常量算出来，与控件位置一一对应；改控件位置时**必须同步改这里**，
 // 否则会出现"按钮看着在 A、实际要点 B"这种最难查的问题。
 // 矩形故意比按钮**大一圈**（左右 +6、上下 +4），手指偏一点也能按到。
+//
+// ★ 2026-09-18：翻页**不再用底部提示条点击区**，改成左右滑动（用户要求）。
+//   原来的两个区（flip->trip / flip->car）已删除，底部那两行文字也一起删了。
 // ═══════════════════════════════════════════════════════════════════════════
 
-void HitFlipToTrip(void* user) {
+/** 滑动回调：向左划（←）= 进入下一页（车况 → 行程）。 */
+void SwipeNext(void* user) {
     (void)user;
+    ESP_LOGI(TAG, "swipe left -> trip page");
     atz_car_page_set_page(1);
 }
 
-void HitFlipToCar(void* user) {
+/** 滑动回调：向右划（→）= 退回上一页（行程 → 车况）。 */
+void SwipePrev(void* user) {
     (void)user;
+    ESP_LOGI(TAG, "swipe right -> car page");
     atz_car_page_set_page(0);
 }
 
 void RegisterHitZones(void) {
-    // ── 车况页：底部提示条 = 翻到行程页（只占底部一条，别的地方点了不翻页）──
-    {
-        const int w = (ATZ_CAR_PAGE_COL_W + 40 < SafeWidthAt(ATZ_CAR_HINT_Y))
-                          ? (ATZ_CAR_PAGE_COL_W + 40)
-                          : SafeWidthAt(ATZ_CAR_HINT_Y);
-        const int x1 = (LV_HOR_RES - w) / 2;
-        g_zone_flip_trip = RegisterZone(x1, ATZ_CAR_HINT_Y - 8, x1 + w - 1,
-                                        ATZ_CAR_HINT_Y + 31 + 8, HitFlipToTrip, "flip->trip");
-    }
-
     // ── 行程页：两个按钮（位置由头部常量算出，与控件一一对应）────────────────
     {
         const int row_w = 2 * ATZ_TRIP_BTN_W + 8;
@@ -937,31 +909,40 @@ void RegisterHitZones(void) {
                                     HitResetTrip, "trip.reset");
     }
 
-    // ── 行程页：底部提示条 = 返回车况页 ────────────────────────────────────
-    {
-        const int w = (ATZ_CAR_PAGE_COL_W + 40 < SafeWidthAt(ATZ_TRIP_HINT_Y))
-                          ? (ATZ_CAR_PAGE_COL_W + 40)
-                          : SafeWidthAt(ATZ_TRIP_HINT_Y);
-        const int x1 = (LV_HOR_RES - w) / 2;
-        g_zone_flip_car = RegisterZone(x1, ATZ_TRIP_HINT_Y - 8, x1 + w - 1,
-                                       ATZ_TRIP_HINT_Y + 31 + 8, HitFlipToCar, "flip->car");
-    }
-
     ApplyZoneEnable();   // 初始显示车况页
 }
 
 /**
- * 按当前页启用/停用各自的点击区。
- * ★ 车况页与行程页的底部提示条**坐标完全相同**（都是 y≈318..365 那一条），而
- *   atz_hit_zone_test 会返回"后注册的那一块" —— 不加这个开关的话，在车况页点底部会命中
- *   行程页的"返回车况"，等于什么都没发生。所以每页的区只在自己那一页启用。
+ * 按当前页启用/停用各自的点击区 + 注册滑动回调（**每次翻页时调用**）。
+ *
+ * 点击区：行程页的两个按钮只在行程页生效。
+ * 滑动：
+ *   · 车况页(page0)：左划 → 行程页(page1)；右划 → 不注册（已经是第一页）
+ *   · 行程页(page1)：右划 → 车况页(page0)；左划 → 不注册（已经是第二页）
+ *
+ * ★★ 这里**只看 `g_page_no`，绝不看"页面当前是否可见"** —— 踩过的坑：
+ *   `ApplyPageVisibility()` 是**先调本函数、最后才清 HIDDEN 标志**的，所以在
+ *   show/set_page 的执行过程中 `atz_car_page_visible()` 还返回 false。
+ *   早先这里写了 `if (!atz_car_page_visible()) { 清空 handler; return; }`，
+ *   结果**每次翻页都把刚注册的滑动回调清掉** —— 实测表现就是"车况页左划不动"。
+ *   "整屏页没显示"那种情况由 RegisterMainScreenGestures() 单独负责。
  */
 void ApplyZoneEnable(void) {
     const bool trip = (g_page_no == 1);
-    atz_hit_zone_set_enabled(g_zone_flip_trip, !trip);
-    atz_hit_zone_set_enabled(g_zone_flip_car, trip);
     atz_hit_zone_set_enabled(g_zone_rec, trip);
     atz_hit_zone_set_enabled(g_zone_reset, trip);
+    atz_swipe_set_handler(ATZ_SWIPE_LEFT, trip ? nullptr : SwipeNext, nullptr);
+    atz_swipe_set_handler(ATZ_SWIPE_RIGHT, trip ? SwipePrev : nullptr, nullptr);
+}
+
+/**
+ * 整屏页**没显示**（= 主界面）时的手势归属：两个方向都不注册，
+ * 于是手势落到触摸任务的兜底分支 —— **主界面左划 → 打开车况页**（用户要求）。
+ * 在 atz_car_page_init() 与 atz_car_page_hide() 里调用。
+ */
+void RegisterMainScreenGestures(void) {
+    atz_swipe_set_handler(ATZ_SWIPE_LEFT, nullptr, nullptr);
+    atz_swipe_set_handler(ATZ_SWIPE_RIGHT, nullptr, nullptr);
 }
 
 void RefreshPage(void) {
@@ -1154,6 +1135,9 @@ void atz_car_page_init(Display* display) {
 
     g_timer = lv_timer_create(PageTimerCb, ATZ_CAR_PAGE_REFRESH_MS, nullptr);
 
+    // 主界面手势兜底：左划进车况页（整屏页没显示时生效；翻页时由 ApplyZoneEnable 接管）
+    RegisterMainScreenGestures();
+
     // ── 语音入口 ──────────────────────────────────────────────────────────
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddTool(
@@ -1266,6 +1250,8 @@ void atz_car_page_hide(void) {
     }
     DisplayLockGuard lock(g_display);
     lv_obj_add_flag(g_page, LV_OBJ_FLAG_HIDDEN);
+    // 页面藏起来后：点击区失效、滑动权交回主界面兜底（左划 → 再进车况页）
+    RegisterMainScreenGestures();
     ESP_LOGI(TAG, "car page hidden");
 }
 
