@@ -199,8 +199,19 @@ console.log(`\n  [5/5] 推送 ${BRANCH} → ${REMOTE}${TOKEN ? '（用 --token�
 
 let credFile = '';
 if (TOKEN) {
-  // 临时凭据助手：仅本进程有效，推完在 finally 里删掉
-  credFile = path.join(process.env.USERPROFILE || process.env.HOME || ROOT, '.git-credentials-atz-tmp');
+  // 临时凭据文件：只在本进程用。
+  // ★ 不在 finally 里立刻删除 —— git push 成功后还会有后台进程去更新凭据存储，
+  //   文件被秒删会导致 `fatal: unable to get credential storage lock ... Permission denied`。
+  //   改为**下次运行时清理**（超过 1 小时的临时凭据文件视为残留）。
+  const home = process.env.USERPROFILE || process.env.HOME || ROOT;
+  for (const f of fs.existsSync(home) ? fs.readdirSync(home) : []) {
+    if (!f.startsWith('.git-credentials-atz-tmp')) continue;
+    const p = path.join(home, f);
+    try {
+      if (Date.now() - fs.statSync(p).mtimeMs > 3600_000) { fs.unlinkSync(p); console.log(`  （清理上次残留的临时凭据文件 ${f}）`); }
+    } catch { /* 忽略 */ }
+  }
+  credFile = path.join(home, '.git-credentials-atz-tmp');
   fs.writeFileSync(credFile, `https://${USER}:${TOKEN}@github.com`, 'ascii');
   git(['config', '--local', 'credential.helper', `store --file=${credFile}`]);
 }
@@ -209,10 +220,19 @@ let push;
 try {
   push = spawnSync(GIT, ['push', '-u', REMOTE, BRANCH], { cwd: ROOT, stdio: 'inherit' });
 } finally {
-  if (TOKEN) {
-    tryGit(['config', '--local', '--unset', 'credential.helper']);
-    try { fs.unlinkSync(credFile); } catch { /* 已删 */ }
-  }
+  // 只注销 helper（仓库配置必须干净）
+  if (TOKEN) tryGit(['config', '--local', '--unset', 'credential.helper']);
+}
+
+// ★ 用 --token 推送时，凭据**不许留在系统里**。
+//   实测坑：这台机器 system 层配了 `credential.helper manager`（Git Credential Manager），
+//   即使我们把 local helper 注销了，GCM 仍会把用过的 token 存进 Windows 凭据管理器
+//   （`cmdkey /list` 里能看到 git:https://github.com）。所以用完必须显式删掉。
+if (TOKEN) {
+  try {
+    execFileSync('cmdkey', ['/delete:LegacyGeneric:target=git:https://github.com'], { stdio: 'ignore' });
+    console.log('  （已清除 Windows 凭据管理器里的 GitHub 凭据残留）');
+  } catch { /* 本来就没有，忽略 */ }
 }
 
 if (push.status === 0) {
