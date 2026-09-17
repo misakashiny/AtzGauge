@@ -17,6 +17,7 @@
 // 退出码：0 = 推送成功；1 = 有阻塞，按提示处理。
 
 import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -72,6 +73,10 @@ const REPO = arg('repo', 'AtzGauge');
 const CHECK_ONLY = argv.includes('--check');
 const NO_BACKUP = argv.includes('--no-backup');
 const BRANCH = arg('branch', 'master');
+// 非交互场景（脚本/自动化）可以直接给 token，避免依赖弹窗。
+// ★ 只用于**本次进程**：临时凭据助手的文件在推送结束后立刻删除，绝不写进仓库配置。
+//   平时手动推送不需要它 —— 弹窗填一次，Windows 凭据管理器会记住。
+const TOKEN = arg('token', process.env.ATZ_GH_TOKEN || '');
 
 function git(args, opts = {}) {
   return execFileSync(GIT, args, { cwd: ROOT, encoding: 'utf8', stdio: opts.inherit ? 'inherit' : 'pipe' });
@@ -173,8 +178,25 @@ if (!NO_BACKUP) {
 }
 
 // ── 6. 推送 ─────────────────────────────────────────────────────────────────
-console.log(`\n  [5/5] 推送 ${BRANCH} → ${REMOTE}（第一次会弹窗要 token）…\n`);
-const push = spawnSync(GIT, ['push', '-u', REMOTE, BRANCH], { cwd: ROOT, stdio: 'inherit' });
+console.log(`\n  [5/5] 推送 ${BRANCH} → ${REMOTE}${TOKEN ? '（用 --token，非交互）' : '（第一次会弹窗要 token）'} …\n`);
+
+let credFile = '';
+if (TOKEN) {
+  // 临时凭据助手：仅本进程有效，推完在 finally 里删掉
+  credFile = path.join(process.env.USERPROFILE || process.env.HOME || ROOT, '.git-credentials-atz-tmp');
+  fs.writeFileSync(credFile, `https://${USER}:${TOKEN}@github.com`, 'ascii');
+  git(['config', '--local', 'credential.helper', `store --file=${credFile}`]);
+}
+
+let push;
+try {
+  push = spawnSync(GIT, ['push', '-u', REMOTE, BRANCH], { cwd: ROOT, stdio: 'inherit' });
+} finally {
+  if (TOKEN) {
+    tryGit(['config', '--local', '--unset', 'credential.helper']);
+    try { fs.unlinkSync(credFile); } catch { /* 已删 */ }
+  }
+}
 
 if (push.status === 0) {
   console.log(`\n✓ 推送完成：https://github.com/${USER}/${REPO}\n`);
