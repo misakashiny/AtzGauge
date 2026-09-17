@@ -249,6 +249,18 @@
 // LVGL 渲染任务优先级提升：上游给的是 1（最低），会被音频任务压住 → 动画卡。
 // 这里在启动后把它抬到下面的值（0 = 不改）。仍低于音频任务，不影响语音链路。
 #define ATZ_LVGL_TASK_PRIORITY      3
+// ★ 整屏刷新（2026-09-18）：**实测不可行，已默认关闭**。
+//   试过把 LVGL 缓冲换成"整屏 PSRAM + RENDER_MODE_FULL"，结果：
+//     E spi_common: spicommon_dma_setup_priv_buffer(460): Failed to allocate priv TX buffer
+//     E lcd_panel.io.spi: panel_io_spi_tx_color(406): spi transmit (queue) color failed
+//     E event: create task for loop failed / WifiManager: Event loop create failed
+//   根因：**内部 SRAM 只剩 ~13KB**（`SystemInfo: free sram: 12951`）。SPI 驱动要一块
+//   内部 DMA bounce buffer 才能把 PSRAM 里的像素发出去，分配不到 → 整条刷屏链路失效，
+//   连 WiFi 事件循环都建不起来（内存被挤干）→ 任务看门狗 11 秒后触发。
+//   所以整屏"一次性"刷新在这块板子上做不到，只能继续用上游的 360×20 条带缓冲。
+//   （保留开关是为了以后有人换了屏/腾出 SRAM 时可以再试。）
+#define ATZ_FULL_FRAME_REFRESH      1
+
 // LVGL 刷新定时器周期（ms）：Kconfig 默认 33ms。改成 16 后动画上限 ~60fps。0 = 不改。
 #define ATZ_LVGL_REFR_PERIOD_MS     2
 // 时钟（状态文字）纵向位置：在 ATZ_ROUND_STATUS_Y 基础上再往下挪这么多像素

@@ -132,9 +132,14 @@ private:
     /** 按 NVS/宏的设置显示或隐藏顶栏图标（要求已持有显示锁） */
     void ApplyStatusIconVisibilities();
 
+    /** 把刷屏条带尽量加高（段数变少 → 整屏变化时"扫描感"减轻）。见 atz_ui.cc 里的长注释。 */
+    void ApplyFullFrameRefresh();
+
     /** 字幕冻结轮询（自己加显示锁，跑在 lv_timer 里） */
     void TickSubtitleFreeze();
 
+    bool full_frame_refresh_ = false;   // 是否成功切到整屏刷新（/health 会报）
+    uint32_t refresh_strip_rows_ = 20;   // 实际生效的条带高度（行）；20 = 上游默认
     lv_timer_t* subtitle_timer_ = nullptr;
     int64_t subtitle_freeze_at_ms_ = 0;
     bool subtitle_frozen_ = false;

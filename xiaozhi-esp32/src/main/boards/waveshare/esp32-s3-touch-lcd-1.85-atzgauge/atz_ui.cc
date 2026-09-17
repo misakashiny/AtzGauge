@@ -23,6 +23,7 @@
 #include "obd_data_cache.h"
 #include "settings.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -252,7 +253,14 @@ void AtzLcdDisplay::SetupUI() {
 
     DisplayLockGuard lock(this);
 
-    // 尺寸微调：始终生效（与 ATZ_UI_ENABLE 无关）
+    // ★★ 整屏刷新模式（2026-09-18）：**必须在 SetupUI 之后、画第一帧之前**改。
+    //   为什么：上游 SpiLcdDisplay 只给 LVGL 分了一块 360×20 的条带缓冲（内部 DMA RAM），
+    //   于是**每一次刷新都被切成 18 个条带、一个一个往下写**。切页/滑动这种整屏变化时，
+    //   肉眼看到的就是"从上到下一条一条刷过去"（用户原话："是从下到上的刷新方式，
+    //   希望的是整个屏幕一起刷新"）。
+    //   改法：换成**整屏大小的 PSRAM 缓冲 + LV_DISPLAY_RENDER_MODE_FULL** —— LVGL 先把
+    //   整帧渲染完，再一次性交给面板，屏幕上就不会出现"半个旧帧 + 半个新帧"的过程。
+    ApplyFullFrameRefresh();
     ApplySizes();
     // 圆形屏布局修正：把上游整宽的顶栏/底栏收进圆的可视区
     ApplyRoundScreenLayout();
@@ -684,6 +692,71 @@ void AtzLcdDisplay::DescribeSizes(char* buf, size_t len) {
              g_emoji_scale_pct, src_w, src_h, box_w, box_h, g_clock_scale_pct, font_px, line_h);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 刷屏方式：把"条带"尽量加高，减少一次整屏变化被拆成多少段
+//
+// 背景（用户原话）："滑动的时候屏幕刷新感官不是很好、是从下到上的刷新方式，
+//                    希望的是整个屏幕一起刷新、类似于没有动画那种"。
+// 机理：上游 SpiLcdDisplay 给 LVGL 的是一块 **360×20** 的条带缓冲，一次整屏变化会被
+//       LVGL 拆成 18 段，一段一段 flush 给面板；每段都是一次独立的 RAMWR 写入，
+//       所以肉眼看得到"一条一条往下刷"。
+//
+// ★ 先试过**整屏 PSRAM 缓冲 + RENDER_MODE_FULL**（真正"整帧一次"），结论：**不可行**：
+//     E spi_common: spicommon_dma_setup_priv_buffer(460): Failed to allocate priv TX buffer
+//     E lcd_panel.io.spi: panel_io_spi_tx_color(406): spi transmit (queue) color failed
+//     E event: create task for loop failed / WifiManager: Event loop create failed → 看门狗复位
+//   根因：**内部 SRAM 只剩 ~13KB**（同一次日志里 `SystemInfo: free sram: 12951`）。
+//   SPI 驱动需要一块**内部 DMA bounce buffer** 才能把 PSRAM 里的像素发出去 —— 分配不到，
+//   整条刷屏链路失效，还把 WiFi 事件循环的内存挤没了。
+//   ⇒ "整帧一次"在这块板子上做不到，别再来一遍。
+//
+// 退一步的可行做法：**条带加高**（仍放在内部 DMA RAM，走原来那条被验证过的路径）。
+//   段数 = 屏高 ÷ 条带高：20px→18 段；60px→6 段；120px→3 段。段数越少，一次刷新的
+//   过程越短、越接近"整屏一起换"。下面从大到小试，**能分配多大就用多大**；
+//   全都失败就保持上游设置（功能优先，宁可有扫描感也不能黑屏）。
+// ═══════════════════════════════════════════════════════════════════════════
+void AtzLcdDisplay::ApplyFullFrameRefresh() {
+#if ATZ_FULL_FRAME_REFRESH
+    lv_display_t* disp = lv_display_get_default();
+    if (disp == nullptr) {
+        ESP_LOGW(TAG, "refresh tuning: no default display, keeping upstream strip buffer");
+        return;
+    }
+    const uint32_t w = (uint32_t)lv_display_get_horizontal_resolution(disp);
+    const uint32_t h = (uint32_t)lv_display_get_vertical_resolution(disp);
+    if (w == 0 || h == 0) {
+        return;
+    }
+    static const uint32_t kCandidates[] = {120, 90, 60, 48, 40, 24};
+    for (uint32_t rows : kCandidates) {
+        if (rows >= h) {
+            continue;   // 等于整屏 = 走"整帧"那条路，已验证不可行，跳过
+        }
+        const uint32_t bytes = w * rows * 2;   // RGB565
+        // ★ 必须留在**内部 DMA 内存**：PSRAM 缓冲 SPI 发不出去（见上面的日志证据）
+        uint8_t* buf1 = (uint8_t*)heap_caps_aligned_alloc(CONFIG_LV_DRAW_BUF_ALIGN, bytes,
+                                                          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (buf1 == nullptr) {
+            ESP_LOGI(TAG, "refresh tuning: %u rows (%u KB) unavailable, trying smaller",
+                     (unsigned)rows, (unsigned)(bytes / 1024));
+            continue;
+        }
+        uint8_t* buf2 = (uint8_t*)heap_caps_aligned_alloc(CONFIG_LV_DRAW_BUF_ALIGN, bytes,
+                                                          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        lv_display_set_buffers(disp, buf1, buf2, bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+        refresh_strip_rows_ = rows;
+        ESP_LOGI(TAG,
+                 "refresh tuning ON: strip %ux%u (2 x %u KB internal DMA) -> %u bands per full "
+                 "repaint (upstream was %u)",
+                 (unsigned)w, (unsigned)rows, (unsigned)(bytes / 1024),
+                 (unsigned)((h + rows - 1) / rows), (unsigned)((h + 19) / 20));
+        return;
+    }
+    ESP_LOGW(TAG, "refresh tuning: nothing bigger than 20 rows fits, keeping upstream buffer");
+#else
+    ESP_LOGI(TAG, "refresh tuning OFF, using upstream strip buffer");
+#endif
+}
 void AtzLcdDisplay::ApplySizes() {
     // ── 表情图 ────────────────────────────────────────────────────────────────
     // 两个要点（踩过的坑）：
