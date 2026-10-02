@@ -53,22 +53,25 @@
 
 ```powershell
 # ── 从表（ESP-IDF v6.1 @ D:\esp）────────────────────────────
-# 编译（板型参数必须带厂商前缀）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\idf-run.ps1 `
-    -Command "python scripts/build.py waveshare/esp32-s3-touch-lcd-1.85-atzgauge"
-# 烧录（别用 @flash_args，Windows 引号传不过去）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\idf-run.ps1 `
-    -Command "cmd /c tools\flash-atzgauge.bat"
-# 抓日志（自复位，从第一行抓）
+# ⚠️ 走 Python 启动器：本机执行策略是 Restricted，idf-run.ps1 里的
+#    dot-source activate-idf.ps1 会被拒绝，脚本却不报错继续跑 →
+#    cmake 找不到 ninja/git，报「unable to find a build program」
+python tools/idf61-run.py --cmd "python scripts/build.py waveshare/esp32-s3-touch-lcd-1.85-atzgauge"
+
+# 烧录 / 抓日志仍可用原脚本（它们不需要 IDF 环境）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\boot-log.ps1 -Seconds 70
 ```
 
 ```bash
 # ── 主表（ESP-IDF v5.5.3 @ D:\esp553）──────────────────────
-# ⚠️ 必须走 Python 启动器；直接调 idf.py 会静默 exit 0
+# ⚠️ 同样必须走 Python 启动器；直接调 idf.py 会静默 exit 0
 python tools/idf553-run.py build
 python tools/idf553-run.py -p COM3 app-flash
 ```
+
+> ⚠️ **两个启动器不可混用**：`idf61-run.py` 用 `D:\esp`（v6.1，取**较新**工具链），
+> `idf553-run.py` 用 `D:\esp553`（v5.5.3，取**较旧**工具链）。共用一个 `IDF_TOOLS_PATH`
+> 时，`cmake` 有 3.30.2 / 4.0.3 两套，选错版本会直接构建失败。
 
 > ⚠️ **串口唯一来源**：脚本参数 → `ATZ_PORT` → **`PORT.txt`** → `COM3`。换电脑只改 `PORT.txt`。
 > ⚠️ **串口是独占的**：抓日志与烧录不能并行。
