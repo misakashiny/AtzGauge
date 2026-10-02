@@ -3,99 +3,129 @@
 把小智 AI（[xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)）改造成一块**圆形车载仪表**：
 插 OBD 口读车况，ESP-NOW 无线送到方向盘旁的圆屏上，同时保留语音对话能力。
 
-- **硬件**：微雪 ESP32-S3-Touch-LCD-1.85（1.85" 圆屏 360×360，SKU 28514）+ Vgate iCar Pro 2S（BLE ELM327）
-- **车**：马自达阿特兹 2020 运动版
-- **状态**：台架（bench）全链路已验证，**上车首测待做** —— 见 [`开发参考/15-上车首测清单.md`](开发参考/15-上车首测清单.md)
+- **从表（= 本仪表）**：微雪 ESP32-S3-Touch-LCD-1.85（1.85" 圆屏 360×360，SKU 28514）+ Vgate iCar Pro 2S（BLE ELM327）
+- **主表（= 车上的数据源）**：同型号板，跑上游 `obd_brz_gauge` 固件
+- **车**：马自达阿特兹 2020 运动版（协议 6，ISO 15765-4 CAN@500k）
+- **状态**：台架全链路已验证；**上车首测未完成**
 
 ---
 
-## 这套东西长什么样
-
-| 页面 | 内容 |
-|---|---|
-| **主界面（表情页）** | 表情动画 + 顶部时钟 + 车况常显条（转速/车速/水温…），点屏说话，**左划**进车况页 |
-| **车况页（第 1 页）** | ESP-NOW 主表 10Hz 的 10 个字段整屏显示（转速/车速/水温/油温/进气/负荷/节气门/电压/油压/空燃比），2 秒无数据转灰，**右划**回主界面 |
-| **行程统计页（第 2 页）** | 里程 / 最高转速 / 平均与最高车速 / 高转时长 / 行驶时长，可手动开始记录、一键清零 |
-
-语音能直接控制界面：「换成夜间模式」「把车况条关掉」「看行程统计」「模拟一下转速」等
-（注册为 MCP 工具 `self.ui.*` / `self.car.*`，走小智云端）。
-
-## 架构
+## 🚀 接手第一件事
 
 ```
-                 BLE                     ESP-NOW                SPI/QSPI
- 车 ── OBD2 ── Vgate iCar Pro 2S ──► 主表 ESP32 ──► (2.4GHz) ──► 从表 = 本仪表 ──► 圆屏
-                                          │                          │
-                                     读 PID、算字段              显示 + 语音（小智 AI 云端）
+1. 读 docs/00_交接总纲.md          ← 环境事实与架构约束（不照做必失败）
+2. 读 docs/01_迭代清单.md          ← 还剩什么没做 + 已排除的非目标
+3. 跑一次从表编译                   ← 确认工具链可用（不要跳过）
+4. 读 开发参考/15-上车首测清单.md    ← 当前主线任务
 ```
 
-- **主表**：另一块 ESP32，负责 OBD 解析与 ESP-NOW 广播（本项目只含从表固件；主表固件在 `obd_brz_gauge` 分支/仓库）
-- **从表**：本仓库的板型 `waveshare/esp32-s3-touch-lcd-1.85-atzgauge`，在官方小智固件基础上加 UI 与车况链路
-- ⚠️ **路由器/热点必须在 2.4GHz 信道 1**（ESP-NOW 与 WiFi 共用信道，主表固定在信道 1）
+要改代码时直接查 **`docs/02_源码导读.md`** 的「改 X 动哪里」速查表。
 
-## 编译与烧录
+---
+
+## 📁 目录地图
+
+| 路径 | 体积 | 说明 |
+|---|---|---|
+| **`docs/`** | 28 K | ★**交接文档**：`00_交接总纲` / `01_迭代清单` / `02_源码导读` + `patches/` |
+| **`开发参考/`** | 604 K | ★**项目全部记忆**：25 份台账文档，入口是 `00-总览与索引.md` |
+| **`tools/`** | 261 K | ★构建 / 烧录 / 抓日志 / 模拟台 / 表情包 / 备份等 42 个脚本 |
+| **`obd_brz_gauge/`** | 164 M | 主表工程。`repo/` 是**可构建的上游克隆**（含我们的帧率补丁） |
+| **`xiaozhi-esp32/`** | 50 M | 从表工程。`src/` 上游源码，`mods-atzgauge/` 升级套件 |
+| **`backup/`** | 57 M | ★证据。**含出厂固件整片备份，不可再生** |
+| `upstream/` | 13 M | 上游 v2.5.0 原始快照（校验 mods 套件用） |
+| `android_app/` | 4.3 M | 配套安卓 App |
+| `mytheme/` · `mazda-gauge/` | 68 K | 主题骨架 / 素材 |
+| `马自达仪表-制作指南.md` | 12 K | ⚠️ **含「安全红线」与「常见错误」，动车上接线前必读** |
+| **`_archive/`** | 859 M | **归档区，可整目录删除**（详见下） |
+
+### `_archive/` 说明
+
+装的是两个 ESP-IDF 工程的依赖目录（`managed_components`），本次整理时从工程里移出：
+
+- **有网编译** → 不用管，IDF 会按 `dependencies.lock` 自动重下
+- **想省 860 MB 下载** → 把目录移回原位（`xiaozhi-esp32/src/` 与 `obd_brz_gauge/repo/`）再编译
+- **磁盘紧张** → **整个 `_archive/` 直接删掉**，零风险
+
+---
+
+## 🔧 快速命令
 
 ```powershell
-# 1) 准备官方固件源码（本仓库不含上游，1.19 GB 太大）
-git clone --depth 1 https://github.com/78/xiaozhi-esp32.git xiaozhi-esp32/src
-
-# 2) 打上本项目的改动（补丁 + 新增文件，幂等可重跑）
-cd xiaozhi-esp32/mods-atzgauge
-node apply-mods.mjs          # 打补丁
-node verify-mods.mjs         # 校验：39 项就位
-
-# 3) 编译（ESP-IDF v6.1；本机用 tools/idf-run.ps1 包了一层环境激活）
+# ── 从表（ESP-IDF v6.1 @ D:\esp）────────────────────────────
+# 编译（板型参数必须带厂商前缀）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\idf-run.ps1 `
     -Command "python scripts/build.py waveshare/esp32-s3-touch-lcd-1.85-atzgauge"
-
-# 4) 烧录（把 COM3 换成你的串口）
+# 烧录（别用 @flash_args，Windows 引号传不过去）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\idf-run.ps1 `
     -Command "cmd /c tools\flash-atzgauge.bat"
+# 抓日志（自复位，从第一行抓）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\boot-log.ps1 -Seconds 70
 ```
 
-> 上游文件**只改了 2 个**（`main/CMakeLists.txt`、`main/Kconfig.projbuild`），其余全是新增文件。
-> 升级上游后跑一次 `apply-mods.mjs` 即可，细节见 [`mods-atzgauge/MODIFICATIONS.md`](xiaozhi-esp32/mods-atzgauge/MODIFICATIONS.md)。
+```bash
+# ── 主表（ESP-IDF v5.5.3 @ D:\esp553）──────────────────────
+# ⚠️ 必须走 Python 启动器；直接调 idf.py 会静默 exit 0
+python tools/idf553-run.py build
+python tools/idf553-run.py -p COM3 app-flash
+```
 
-## 界面调参：只改一个文件
+> ⚠️ **串口唯一来源**：脚本参数 → `ATZ_PORT` → **`PORT.txt`** → `COM3`。换电脑只改 `PORT.txt`。
+> ⚠️ **串口是独占的**：抓日志与烧录不能并行。
 
-[`atz_ui_config.h`](xiaozhi-esp32/src/main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/atz_ui_config.h)
-是**唯一调参面板**：主题、车况条、字号、时钟位置、行程统计、刷屏方式、告警、调光……全在里面，改完重编译即可，不用碰上游代码。
+---
 
-**调试口令等私密值不放仓库**：板目录下的 `atz_local.h` 不进 git，在那里重新 `#define` 即可覆盖默认值
-（模板见 [`开发参考/atz_local.h.example`](开发参考/atz_local.h.example)）。没有这个文件也能正常编译。
+## ⚠️ 三条最容易踩的坑
 
-## 仓库结构
+| 坑 | 后果 | 对策 |
+|---|---|---|
+| **路径含中文/空格** | ESP-IDF 直接失效 | 只在 **`D:\AtzGauge`** 编译 |
+| **直接调 `idf.py`（主表）** | 静默 exit 0，白等 | 走 `tools/idf553-run.py` |
+| **用错 IDF 版本** | 编译失败 | 从表 v6.1 / 主表 v5.5.3，**不可互换** |
 
-| 路径 | 内容 |
+> 完整清单（7 条铁律）见 [`docs/00_交接总纲.md`](docs/00_交接总纲.md) 第三节。
+
+---
+
+## 🔐 不可再生资产
+
+| 资产 | 位置 |
 |---|---|
-| `xiaozhi-esp32/src/main/boards/waveshare/esp32-s3-touch-lcd-1.85-atzgauge/` | 板型：UI、车况页、行程统计、调试端点（`atz_ui_config.h` 是调参入口） |
-| `xiaozhi-esp32/src/main/espnow_slave/` | ESP-NOW 从表、车况数据缓存、告警规则 |
-| `xiaozhi-esp32/mods-atzgauge/` | 升级维护套件：patch + 新增文件快照 + 一键重打/校验脚本 |
-| `开发参考/` | 全部开发文档：路径规范、环境配置、迭代日志与缺陷台账、界面清单、几何实测、表情包规范 |
-| `tools/` | 构建/烧录/抓日志/尺寸量测/表情包推送/模拟台/仓库备份等脚本（多数可双击 `.cmd` 运行） |
+| **出厂固件整片备份**（16 MB） | `backup/archive/2026-09/firmware/factory-16MB.bin` |
+| **改小智前的仪表固件**（16 MB） | `backup/archive/2026-09/firmware/obd-gauge-current-before-xiaozhi-16MB.bin` |
+| 历次启动日志与界面实测截图 | `backup/`（133 项） |
 
-**想快速了解全貌** → [`开发参考/00-总览与索引.md`](开发参考/00-总览与索引.md)
-**动手改代码前** → [`开发参考/18-迭代日志-结构变更与缺陷台账.md`](开发参考/18-迭代日志-结构变更与缺陷台账.md)（含所有踩过的坑）
-**改界面** → [`开发参考/20-界面元素清单与页面清单.md`](开发参考/20-界面元素清单与页面清单.md) 与 [`21-界面几何总表（实测）.md`](开发参考/21-界面几何总表（实测）.md)
+> **`backup/` 不是垃圾目录**，整理时已刻意保留。`tools/prune-backup.mjs` 可瘦身（只移动不删除，默认空跑）。
 
-## 常用工具（`tools\`）
+---
 
-| 工具 | 用途 |
-|---|---|
-| `idf-run.ps1` | 在 ESP-IDF v6.1 环境里跑任意命令（本机执行策略不允许 dot-source） |
-| `flash-atzgauge.bat` / `boot-log.ps1` | 烧录 / 抓串口启动日志 |
-| `emoji-kit.cmd` | **换表情包**：体检→打包→本地服务器→设备下载，不用重刷固件（双击可用） |
-| `sim-console.cmd` | **车况模拟台**：PC 端 10Hz 发模拟转速等数据给设备，台架验证用（双击可用） |
-| `backup-repo.cmd` | 把仓库备份到另一块物理盘（默认 `E:\backup\AtzGauge.git`） |
+## 📌 项目约束（速记）
 
-设备 IP 用 `--device <IP>` 或环境变量 `ATZ_DEVICE` 指定；调试口令用 `--key=` 或 `ATZ_DEBUG_TOKEN`。
+- 两个 ESP-IDF 工程**并列，不能嵌套**；各自有 `CMakeLists.txt` / `sdkconfig` / `build/`
+- 从表相对上游**只改 2 个文件（3 处连续块）**，其余全是新增文件；升级上游后跑 `node mods-atzgauge/apply-mods.mjs` 即可
+- **板型标识 `esp32-s3-touch-lcd-1.85-atzgauge` 决定 OTA 通道，绝不能改**（改了会被官方固件静默覆盖）
+- **路由器/热点必须锁信道 1**（主表把 ESP-NOW 信道硬编码为 1）
+- 私密口令放板目录 `atz_local.h`（**不进 git**；模板见 `开发参考/atz_local.h.example`）
+- 主表补丁是**未提交**的工作树修改，已导出到 `docs/patches/00-master-framerate.patch`
+
+---
+
+## 版本管理
+
+| 远端 | 地址 | 用途 |
+|---|---|---|
+| `origin` | `E:\backup\AtzGauge.git` | 异地物理盘备份（`tools\backup-repo.cmd`） |
+| `github` | `https://github.com/misakashiny/AtzGauge.git` | 云端私有仓库（`tools\gh-push.cmd`） |
+
+`.gitignore` 是**白名单式**，只纳管约 1 MB 的「知识资产」
+（`docs/` + `开发参考/` + `tools/` + `mods-atzgauge/` + 板型 + 从表 + README + LICENSE），
+不跟踪 `build/` / `managed_components/` / `upstream/` / `backup/`。
+
+---
 
 ## 许可与出处
 
-- 基于 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（MIT）修改；本仓库**只含我们自己写的部分**，不含上游源码
-- 上游协议与文档归档在 [`开发参考/xiaozhi-ai/`](开发参考/xiaozhi-ai/)（版权归原作者）
-- OBD 解析思路参考 [steveEcode/obd_brz_gauge](https://github.com/steveEcode/obd_brz_gauge)
+- 基于 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（MIT）修改；本仓库**只含我们自己写的部分**
+- 上游协议与文档归档在 `开发参考/xiaozhi-ai/`（版权归原作者）
+- OBD 解析参考 [steveEcode/obd_brz_gauge](https://github.com/steveEcode/obd_brz_gauge)
 - 本仓库自有代码沿用 MIT，见 [`LICENSE`](LICENSE)
-
-> ⚠️ **安全提示**：车上接线涉及 12V 与安全气囊相关线束，动手前务必读
-> [`马自达仪表-制作指南.md`](马自达仪表-制作指南.md) 的「安全红线」与「常见错误」两节。
