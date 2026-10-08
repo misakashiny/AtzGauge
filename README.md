@@ -118,7 +118,7 @@ python tools/idf553-run.py -p COM3 app-flash
 | 远端 | 地址 | 用途 |
 |---|---|---|
 | `origin` | `E:\backup\AtzGauge.git` | 异地物理盘备份（`tools\backup-repo.cmd`） |
-| `github` | `https://github.com/misakashiny/AtzGauge.git` | 云端私有仓库（`tools\gh-push.cmd`） |
+| `github` | `https://github.com/misakashiny/AtzGauge.git` | 云端公开仓库（`tools\gh-push.cmd`） |
 
 `.gitignore` 是**白名单式**，只纳管约 1 MB 的「知识资产」
 （`docs/` + `开发参考/` + `tools/` + `mods-atzgauge/` + 板型 + 从表 + README + LICENSE），

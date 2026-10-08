@@ -1,4 +1,4 @@
-// gh-push.mjs -- 把本地仓库推送到 GitHub 私有仓库（顺带先做一次发布体检）
+// gh-push.mjs -- 把本地仓库推送到 GitHub 公开仓库（顺带先做一次发布体检）
 //
 // 用法（推荐双击 tools\gh-push.cmd）：
 //   node tools/gh-push.mjs --user <GitHub用户名>
